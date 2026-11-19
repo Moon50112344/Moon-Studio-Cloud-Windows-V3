@@ -35,10 +35,10 @@ interface CreateVmModalProps {
 }
 
 export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated }: CreateVmModalProps) {
-  const [selectedOs, setSelectedOs] = useState<SupportedOsId>(initialOs || 'debian-12');
+  const [selectedOs, setSelectedOs] = useState<SupportedOsId>(initialOs || 'windows-7');
   const [vmName, setVmName] = useState<string>('');
   const [cores, setCores] = useState<number>(2);
-  const [memoryMb, setMemoryMb] = useState<number>(initialOs === 'windows-10' ? 4096 : initialOs === 'windows-7' ? 1024 : 2048);
+  const [memoryMb, setMemoryMb] = useState<number>(initialOs === 'windows-10' ? 4096 : initialOs === 'debian-12' ? 2048 : 1024);
   const [diskGb, setDiskGb] = useState<number>(40);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [isoActionBusy, setIsoActionBusy] = useState<boolean>(false);
@@ -84,7 +84,7 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
 
   useEffect(() => {
     if (!isOpen) return;
-    applyOsDefaults(initialOs || 'debian-12');
+    applyOsDefaults(initialOs || 'windows-7');
 
     fetchImages();
     fetch('/api/v1/infra')
@@ -257,7 +257,9 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
                     </div>
                     <p className="text-[#c7dcf7]">
                       {selectedMedia?.status === 'READY' && selectedMedia.exists
-                        ? `Đã lưu cục bộ (${((selectedMedia.sizeBytes || 0) / (1024 * 1024 * 1024)).toFixed(2)} GiB). Khi tạo VM, hệ thống cũng hỗ trợ stream HTTP-Range NBD để tiết kiệm RAM container.`
+                        ? `ISO hợp lệ đã có sẵn trong bộ nhớ đệm (${((selectedMedia.sizeBytes || 0) / (1024 * 1024 * 1024)).toFixed(2)} GiB). Khi tạo VPS mới, hệ thống sẽ tái sử dụng ngay và bỏ qua bước tải lại.`
+                        : selectedOs === 'windows-7'
+                        ? 'Khi nhấn "Tạo máy ảo ngay", hệ thống sẽ tự động kiểm tra cache hoặc tải trực tiếp Windows 7 SP1 x64 ISO, xác minh SHA-256 song song với tạo ổ đĩa QCOW2 và khởi chạy trình cài đặt tự động.'
                         : 'Hệ thống tự động stream qua NBD (~64 MiB cache) khi khởi tạo VM, hoặc bạn có thể tải sẵn và kiểm tra SHA-256 cục bộ ngay tại đây.'}
                     </p>
                     {selectedMedia?.sha256Expected && (

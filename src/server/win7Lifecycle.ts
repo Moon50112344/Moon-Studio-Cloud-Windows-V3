@@ -14,6 +14,144 @@ export type VmLifecycleState =
   | 'STOPPED'
   | 'ERROR';
 
+export type DeploymentStageKey =
+  | 'creating_vps'
+  | 'allocating_resources'
+  | 'preparing_storage'
+  | 'downloading_iso'
+  | 'verifying_iso'
+  | 'preparing_qemu'
+  | 'creating_virtual_disk'
+  | 'starting_installer'
+  | 'installing_windows'
+  | 'configuring_network'
+  | 'starting_rdp'
+  | 'vps_ready';
+
+export type DeploymentStageStatus = 'pending' | 'active' | 'completed' | 'skipped' | 'failed';
+
+export interface DeploymentStageItem {
+  key: DeploymentStageKey;
+  label: string;
+  status: DeploymentStageStatus;
+  detail?: string;
+  updatedAt?: string;
+}
+
+export interface IsoDownloadProgress {
+  status: 'idle' | 'downloading' | 'verifying' | 'cached' | 'failed';
+  percent: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  provider?: string;
+  edition?: string;
+  cachedReused?: boolean;
+  checksumVerified?: boolean;
+  resumable?: boolean;
+  error?: string;
+}
+
+export const DEPLOYMENT_STAGE_ORDER: readonly DeploymentStageKey[] = [
+  'creating_vps',
+  'allocating_resources',
+  'preparing_storage',
+  'downloading_iso',
+  'verifying_iso',
+  'preparing_qemu',
+  'creating_virtual_disk',
+  'starting_installer',
+  'installing_windows',
+  'configuring_network',
+  'starting_rdp',
+  'vps_ready',
+] as const;
+
+const DEPLOYMENT_STAGE_LABELS: Record<DeploymentStageKey, string> = {
+  creating_vps: 'Creating VPS',
+  allocating_resources: 'Allocating CPU and RAM',
+  preparing_storage: 'Preparing storage',
+  downloading_iso: 'Downloading Windows 7 ISO',
+  verifying_iso: 'Verifying ISO integrity',
+  preparing_qemu: 'Preparing QEMU',
+  creating_virtual_disk: 'Creating Windows virtual disk',
+  starting_installer: 'Starting Windows 7 installer',
+  installing_windows: 'Installing Windows',
+  configuring_network: 'Configuring network',
+  starting_rdp: 'Starting remote desktop service',
+  vps_ready: 'VPS Ready',
+};
+
+export function getDeploymentStageLabel(key: DeploymentStageKey): string {
+  return DEPLOYMENT_STAGE_LABELS[key] || key;
+}
+
+export function createInitialDeploymentStages(
+  initialStatus: DeploymentStageStatus = 'pending'
+): DeploymentStageItem[] {
+  const now = new Date().toISOString();
+  return DEPLOYMENT_STAGE_ORDER.map((key, idx) => ({
+    key,
+    label: DEPLOYMENT_STAGE_LABELS[key],
+    status: idx === 0 && initialStatus === 'active' ? 'active' : initialStatus === 'completed' ? 'completed' : 'pending',
+    ...(idx === 0 || initialStatus === 'completed' ? { updatedAt: now } : {}),
+  }));
+}
+
+export function updateDeploymentStage(
+  stages: DeploymentStageItem[] | undefined,
+  key: DeploymentStageKey,
+  status: DeploymentStageStatus,
+  detail?: string
+): DeploymentStageItem[] {
+  const list = Array.isArray(stages) && stages.length === DEPLOYMENT_STAGE_ORDER.length
+    ? stages.map((s) => ({ ...s }))
+    : createInitialDeploymentStages();
+  const target = list.find((s) => s.key === key);
+  if (target) {
+    target.status = status;
+    if (detail !== undefined) {
+      target.detail = detail;
+    }
+    target.updatedAt = new Date().toISOString();
+  }
+  return list;
+}
+
+export function getActiveDeploymentStageKey(stages: DeploymentStageItem[] | undefined): DeploymentStageKey {
+  if (!Array.isArray(stages) || stages.length === 0) return 'creating_vps';
+  const active = stages.find((s) => s.status === 'active');
+  if (active) return active.key;
+  const failed = stages.find((s) => s.status === 'failed');
+  if (failed) return failed.key;
+  const allDone = stages.every((s) => s.status === 'completed' || s.status === 'skipped');
+  if (allDone) return 'vps_ready';
+  const lastDone = [...stages].reverse().find((s) => s.status === 'completed' || s.status === 'skipped');
+  return lastDone ? lastDone.key : 'creating_vps';
+}
+
+export function calculateDeploymentOverallPercent(
+  stages: DeploymentStageItem[] | undefined,
+  isoProgress?: IsoDownloadProgress
+): number {
+  if (!Array.isArray(stages) || stages.length === 0) return 0;
+  const readyStage = stages.find((s) => s.key === 'vps_ready');
+  if (readyStage?.status === 'completed') return 100;
+
+  let points = 0;
+  for (const stage of stages) {
+    if (stage.status === 'completed' || stage.status === 'skipped') {
+      points += 1;
+    } else if (stage.status === 'active') {
+      if (stage.key === 'downloading_iso' && isoProgress && isoProgress.totalBytes > 0) {
+        points += Math.max(0.05, Math.min(0.95, (isoProgress.percent || 0) / 100));
+      } else {
+        points += 0.4;
+      }
+    }
+  }
+  return Math.min(99, Math.max(0, Math.round((points / stages.length) * 100)));
+}
+
 export interface CgroupOomStats {
   oomKillDisable: boolean;
   underOom: boolean;
@@ -48,6 +186,7 @@ export interface VmMemoryBudgetInput {
   hostReserveMb?: number;
   win7MaxRamMb?: number;
   win10MaxRamMb?: number;
+  reservedIsoDownloadMb?: number;
 }
 
 export interface VmMemoryBudgetResult {
@@ -329,17 +468,18 @@ export function calculateSafeVmMemoryBudget(input: VmMemoryBudgetInput): VmMemor
     };
   }
 
-  // Fit within currently available container RAM while reserving hostReserveMb?
-  // Note: hostAvailableMb already reflects existing host + Debian 12 + cached ISO usage.
-  // We keep at least 512 MiB host safety buffer on top of guest + QEMU overhead (or full disk growth check).
+  // Fit within currently available container RAM while reserving hostReserveMb.
+  // Account for any upcoming ISO download (reservedIsoDownloadMb) that will reside on RAM-backed overlayfs.
+  const reservedIsoMb = input.isMemoryBackedOverlay ? Math.max(0, input.reservedIsoDownloadMb ?? 0) : 0;
+  const effectiveHostAvailMb = Math.max(0, input.hostAvailableMb - reservedIsoMb);
   const safetyBufferMb = 512;
-  const maxSafeByAvailMb = input.hostAvailableMb - qemuOverheadMb - safetyBufferMb;
+  const maxSafeByAvailMb = effectiveHostAvailMb - qemuOverheadMb - safetyBufferMb;
   if (input.hostAvailableMb > 0 && targetGuestMb > maxSafeByAvailMb) {
     targetGuestMb = Math.floor(maxSafeByAvailMb / 128) * 128;
   }
 
   if (targetGuestMb < minGuestMb) {
-    const needMb = minGuestMb + qemuOverheadMb + safetyBufferMb;
+    const needMb = minGuestMb + qemuOverheadMb + safetyBufferMb + reservedIsoMb;
     return {
       allowed: false,
       code: 'INSUFFICIENT_HOST_MEMORY',
@@ -351,33 +491,43 @@ export function calculateSafeVmMemoryBudget(input: VmMemoryBudgetInput): VmMemor
       expectedDiskGrowthMb,
       estimatedTotalFootprintMb: needMb,
       headroomAfterMb: input.hostAvailableMb - needMb,
-      reason: `Insufficient available container memory for ${input.osId}: available=${input.hostAvailableMb} MiB, minimum safe requirement=${needMb} MiB (${minGuestMb} MiB guest + ${qemuOverheadMb} MiB hypervisor + ${safetyBufferMb} MiB host buffer).`,
+      reason: `Insufficient available container memory for ${input.osId}: available=${input.hostAvailableMb} MiB, minimum safe requirement=${needMb} MiB (${minGuestMb} MiB guest + ${qemuOverheadMb} MiB hypervisor + ${safetyBufferMb} MiB host buffer${reservedIsoMb > 0 ? ` + ${reservedIsoMb} MiB ISO download` : ''}).`,
       remediation: 'Stop other VMs or remove cached local ISO files before starting installation.',
     };
   }
 
   // On RAM-backed overlayfs during ISO installation, also check whether MemAvailable covers
-  // guest RAM + hypervisor overhead + expected QCOW2 image growth.
-  const runtimeNeededMb = targetGuestMb + qemuOverheadMb;
-  const totalWithDiskGrowthMb = runtimeNeededMb + expectedDiskGrowthMb;
-  const headroomAfterMb = input.hostAvailableMb - totalWithDiskGrowthMb;
+  // guest RAM + hypervisor overhead + expected QCOW2 image growth (+ pending ISO download).
+  // Automatically step down targetGuestMb toward minGuestMb (e.g. 1024 -> 768 MiB for Win7)
+  // before rejecting if doing so preserves >= 256 MiB headroom.
+  let runtimeNeededMb = targetGuestMb + qemuOverheadMb;
+  let totalWithDiskGrowthMb = runtimeNeededMb + expectedDiskGrowthMb;
+  let headroomAfterMb = effectiveHostAvailMb - totalWithDiskGrowthMb;
 
   if (input.isMemoryBackedOverlay && input.attachInstallerIso && input.hostAvailableMb > 0 && headroomAfterMb < 256) {
-    return {
-      allowed: false,
-      code: 'INSUFFICIENT_HOST_MEMORY',
-      allocatedMemoryMb: targetGuestMb,
-      requestedMemoryMb: input.requestedMemoryMb,
-      adjusted: targetGuestMb !== input.requestedMemoryMb,
-      hostReserveMb,
-      qemuOverheadMb,
-      expectedDiskGrowthMb,
-      estimatedTotalFootprintMb: totalWithDiskGrowthMb,
-      headroomAfterMb,
-      reason: `Insufficient RAM on memory-backed container overlayfs for full ${input.osId} installation: MemAvailable=${input.hostAvailableMb} MiB, estimated footprint=${totalWithDiskGrowthMb} MiB (guest=${targetGuestMb} MiB + QEMU=${qemuOverheadMb} MiB + QCOW2 expansion=${expectedDiskGrowthMb} MiB).`,
-      remediation:
-        'Reclaim overlayfs RAM (remove cached local ISOs / unused files, use NBD ISO streaming) or run on a host with >= 16 GiB RAM or disk-backed storage.',
-    };
+    const maxGuestForDiskGrowth = Math.floor((effectiveHostAvailMb - qemuOverheadMb - expectedDiskGrowthMb - 256) / 128) * 128;
+    if (maxGuestForDiskGrowth >= minGuestMb) {
+      targetGuestMb = maxGuestForDiskGrowth;
+      runtimeNeededMb = targetGuestMb + qemuOverheadMb;
+      totalWithDiskGrowthMb = runtimeNeededMb + expectedDiskGrowthMb;
+      headroomAfterMb = effectiveHostAvailMb - totalWithDiskGrowthMb;
+    } else {
+      return {
+        allowed: false,
+        code: 'INSUFFICIENT_HOST_MEMORY',
+        allocatedMemoryMb: targetGuestMb,
+        requestedMemoryMb: input.requestedMemoryMb,
+        adjusted: targetGuestMb !== input.requestedMemoryMb,
+        hostReserveMb,
+        qemuOverheadMb,
+        expectedDiskGrowthMb,
+        estimatedTotalFootprintMb: totalWithDiskGrowthMb + reservedIsoMb,
+        headroomAfterMb,
+        reason: `Insufficient RAM on memory-backed container overlayfs for full ${input.osId} installation: MemAvailable=${input.hostAvailableMb} MiB, estimated footprint=${totalWithDiskGrowthMb + reservedIsoMb} MiB (guest=${targetGuestMb} MiB + QEMU=${qemuOverheadMb} MiB + QCOW2 expansion=${expectedDiskGrowthMb} MiB${reservedIsoMb > 0 ? ` + ISO=${reservedIsoMb} MiB` : ''}).`,
+        remediation:
+          'Reclaim overlayfs RAM (remove cached local ISOs / unused files) or run on a host with >= 16 GiB RAM or disk-backed storage.',
+      };
+    }
   }
 
   return {

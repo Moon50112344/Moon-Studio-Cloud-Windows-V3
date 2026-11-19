@@ -565,12 +565,12 @@ export function buildCommands({
       .addStringOption((opt) =>
         opt
           .setName('os')
-          .setDescription('Operating system for the VPS')
-          .setRequired(true)
+          .setDescription('Operating system for the VPS (defaults to Windows 7 SP1 x64)')
+          .setRequired(false)
           .addChoices(
-            { name: 'Debian 12 (Linux)', value: 'debian-12' },
+            { name: 'Windows 7 SP1 (Default)', value: 'windows-7' },
             { name: 'Windows 10 Pro (x64)', value: 'windows-10' },
-            { name: 'Windows 7 SP1', value: 'windows-7' }
+            { name: 'Debian 12 (Linux)', value: 'debian-12' }
           )
       )
       .addStringOption((opt) =>
@@ -602,7 +602,7 @@ export function buildCommands({
           .setRequired(false)
       ),
     async execute(interaction) {
-      const osId = interaction.options.getString('os', true);
+      const osId = interaction.options.getString('os') || 'windows-7';
       const name = interaction.options.getString('name') || undefined;
       const cores = interaction.options.getInteger('cores') || undefined;
       const memoryMb = interaction.options.getInteger('memory_mb') || undefined;
@@ -702,19 +702,26 @@ export function buildCommands({
       }
 
       if (latestVps.status !== 'Ready' || !latestVps.credentials_ready) {
+        const pendingFields = [
+          { name: 'VPS ID', value: `\`${vpsId}\``, inline: true },
+          { name: 'Current Status', value: `\`${latestVps.status || 'Queued'}\``, inline: true },
+          ...(latestVps.deployment_stage
+            ? [{ name: 'Deployment Stage', value: `\`${latestVps.deployment_stage}\``, inline: true }]
+            : []),
+          ...(latestVps.iso_progress && typeof latestVps.iso_progress.percent === 'number'
+            ? [{ name: 'ISO Progress', value: `\`${latestVps.iso_progress.status} (${latestVps.iso_progress.percent}%)\``, inline: true }]
+            : []),
+          {
+            name: 'Private Recovery',
+            value: `Once \`/vps-info vps_id:${vpsId}\` shows Ready, run \`/get-vps-credentials vps_id:${vpsId}\` to view credentials privately.`,
+            inline: false,
+          },
+        ];
         const pendingEmbed = createStatusEmbed({
           title: 'VPS Provisioning In Progress',
           description: `VPS \`${vpsId}\` is still initializing (${latestVps.status || 'Booting'}). Credentials will become available privately once guest configuration finishes.`,
           color: COLORS.WARNING,
-          fields: [
-            { name: 'VPS ID', value: `\`${vpsId}\``, inline: true },
-            { name: 'Current Status', value: `\`${latestVps.status || 'Queued'}\``, inline: true },
-            {
-              name: 'Private Recovery',
-              value: `Once \`/vps-info vps_id:${vpsId}\` shows Ready, run \`/get-vps-credentials vps_id:${vpsId}\` to view credentials privately.`,
-              inline: false,
-            },
-          ],
+          fields: pendingFields,
         });
         return sendEmbedResponse(interaction, pendingEmbed, { ephemeral: true });
       }
@@ -1001,25 +1008,32 @@ export function buildCommands({
       }
 
       const vps = res.data?.vps || {};
+      const infoFields = [
+        { name: 'VPS ID', value: `\`${vps.vps_id}\``, inline: true },
+        { name: 'Machine ID', value: `\`${vps.machine_id}\``, inline: true },
+        { name: 'Owner Discord ID', value: `\`${vps.discord_user_id}\``, inline: true },
+        { name: 'Operating System', value: String(vps.os_name || vps.os_id), inline: true },
+        { name: 'Status', value: `\`${vps.status}\``, inline: true },
+        ...(vps.deployment_stage
+          ? [{ name: 'Deployment Stage', value: `\`${vps.deployment_stage}\``, inline: true }]
+          : []),
+        ...(vps.iso_progress && typeof vps.iso_progress.percent === 'number'
+          ? [{ name: 'ISO Progress', value: `\`${vps.iso_progress.status} (${vps.iso_progress.percent}%)\``, inline: true }]
+          : []),
+        { name: 'Username', value: `\`${vps.username || 'Administrator'}\``, inline: true },
+        {
+          name: 'Resources',
+          value: `${vps.cores} vCPU • ${vps.memory_mb} MB RAM • ${vps.disk_gb} GB Disk`,
+          inline: true,
+        },
+        { name: 'Public Endpoint', value: `\`${vps.public_endpoint || 'Pending'}\``, inline: true },
+        { name: 'Created At', value: `\`${vps.created_at}\``, inline: true },
+      ];
       const embed = createStatusEmbed({
         title: `VPS Details: ${vps.name || vps.vps_id}`,
         description: vps.status_message || 'Live Cloud VPS configuration and connection status.',
         color: COLORS.PRIMARY,
-        fields: [
-          { name: 'VPS ID', value: `\`${vps.vps_id}\``, inline: true },
-          { name: 'Machine ID', value: `\`${vps.machine_id}\``, inline: true },
-          { name: 'Owner Discord ID', value: `\`${vps.discord_user_id}\``, inline: true },
-          { name: 'Operating System', value: String(vps.os_name || vps.os_id), inline: true },
-          { name: 'Status', value: `\`${vps.status}\``, inline: true },
-          { name: 'Username', value: `\`${vps.username || 'Administrator'}\``, inline: true },
-          {
-            name: 'Resources',
-            value: `${vps.cores} vCPU • ${vps.memory_mb} MB RAM • ${vps.disk_gb} GB Disk`,
-            inline: true,
-          },
-          { name: 'Public Endpoint', value: `\`${vps.public_endpoint || 'Pending'}\``, inline: true },
-          { name: 'Created At', value: `\`${vps.created_at}\``, inline: true },
-        ],
+        fields: infoFields,
       });
       return sendEmbedResponse(interaction, embed, { ephemeral: true });
     },
@@ -1029,7 +1043,7 @@ export function buildCommands({
   commands.set('vps-power', {
     data: new SlashCommandBuilder()
       .setName('vps-power')
-      .setDescription('Control power state, rename, or rotate IP/port on your VPS')
+      .setDescription('Control power state, rename, retry failed deployment, or rotate IP/port on your VPS')
       .addStringOption((opt) => opt.setName('vps_id').setDescription('Target VPS ID').setRequired(true))
       .addStringOption((opt) =>
         opt
@@ -1042,6 +1056,7 @@ export function buildCommands({
             { name: 'Restart VPS', value: 'restart' },
             { name: 'Force Stop', value: 'force-stop' },
             { name: 'Rebuild VPS', value: 'rebuild' },
+            { name: 'Retry Failed Deployment', value: 'retry' },
             { name: 'Reload Public IP & Port', value: 'reload-ip' }
           )
       )
@@ -1111,12 +1126,12 @@ export function buildCommands({
       .addStringOption((opt) =>
         opt
           .setName('os')
-          .setDescription('Default operating system')
+          .setDescription('Default operating system (defaults to Windows 7 SP1)')
           .setRequired(false)
           .addChoices(
-            { name: 'Debian 12 (Linux)', value: 'debian-12' },
+            { name: 'Windows 7 SP1 (Default)', value: 'windows-7' },
             { name: 'Windows 10 Pro (x64)', value: 'windows-10' },
-            { name: 'Windows 7 SP1', value: 'windows-7' }
+            { name: 'Debian 12 (Linux)', value: 'debian-12' }
           )
       )
       .addIntegerOption((opt) =>
@@ -1142,7 +1157,7 @@ export function buildCommands({
     async execute(interaction) {
       const machineId = interaction.options.getString('machine_id', true).trim();
       const name = interaction.options.getString('name')?.trim() || undefined;
-      const osId = interaction.options.getString('os') || 'debian-12';
+      const osId = interaction.options.getString('os') || 'windows-7';
       const cores = interaction.options.getInteger('cores') || undefined;
       const memoryMb = interaction.options.getInteger('memory_mb') || undefined;
       const diskGb = interaction.options.getInteger('disk_gb') || undefined;

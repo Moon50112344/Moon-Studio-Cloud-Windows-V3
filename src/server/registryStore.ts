@@ -444,7 +444,7 @@ export class RegistryStore {
       this.assertCooldownInsideLock(params.discordUserId);
 
       const nowIso = new Date(this.nowProvider()).toISOString();
-      const osId: SupportedOsId = isSupportedOsId(params.osId) ? params.osId : 'debian-12';
+      const osId: SupportedOsId = isSupportedOsId(params.osId) ? params.osId : 'windows-7';
       const record: MachineRecord = {
         machine_id: cleanMachineId,
         discord_user_id: params.discordUserId,

@@ -39,6 +39,12 @@ import {
 import { WindowsAppTroubleshootModal } from './components/WindowsAppTroubleshootModal';
 import { VmDisplayViewer } from './components/VmDisplayViewer';
 import { FileUploadManager } from './components/FileUploadManager';
+import { DeploymentProgressCard } from './components/DeploymentProgressCard';
+import type {
+  DeploymentStageItem,
+  DeploymentStageKey,
+  IsoDownloadProgress,
+} from './server/win7Lifecycle';
 
 interface ConnectionInfo {
   ipAddress: string;
@@ -66,6 +72,11 @@ interface ConnectionInfo {
   networkNotice?: string;
   failureReason?: string;
   statusMessage?: string;
+  deploymentStage?: DeploymentStageKey;
+  deploymentStages?: DeploymentStageItem[];
+  isoProgress?: IsoDownloadProgress;
+  deploymentStartedAt?: string;
+  deploymentCompletedAt?: string;
 }
 
 interface VmItem {
@@ -87,7 +98,8 @@ export default function App() {
   const [data, setData] = useState<ConnectionInfo | null>(null);
   const [vms, setVms] = useState<VmItem[]>([]);
   const [osList, setOsList] = useState<OsDefinition[]>([]);
-  const [selectedOsFilter, setSelectedOsFilter] = useState<SupportedOsId>('debian-12');
+  const [selectedOsFilter, setSelectedOsFilter] = useState<SupportedOsId>('windows-7');
+  const [createModalInitialOs, setCreateModalInitialOs] = useState<SupportedOsId>('windows-7');
   const [loading, setLoading] = useState<boolean>(true);
   const [actionLoading, setActionLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -154,8 +166,8 @@ export default function App() {
           lifecycleState: json.lifecycleState,
           lifecycleLabel: json.lifecycleLabel,
           vmId: json.vmId,
-          osId: json.osId || 'debian-12',
-          osName: json.osName || 'Debian 12',
+          osId: json.osId || 'windows-7',
+          osName: json.osName || 'Windows 7',
           isVerified: json.isVerified,
           directTcpBlocked: json.directTcpBlocked,
           installCompleted: json.installCompleted,
@@ -167,6 +179,11 @@ export default function App() {
           networkNotice: json.networkNotice,
           failureReason: json.failureReason,
           statusMessage: json.statusMessage,
+          deploymentStage: json.deploymentStage,
+          deploymentStages: json.deploymentStages,
+          isoProgress: json.isoProgress,
+          deploymentStartedAt: json.deploymentStartedAt,
+          deploymentCompletedAt: json.deploymentCompletedAt,
         });
         if (json.osId) {
           setSelectedOsFilter(json.osId);
@@ -188,31 +205,38 @@ export default function App() {
     fetchConnection();
   }, []);
 
-  // Real-time polling while provisioning/installing/booting/verifying
+  // Real-time polling while provisioning/downloading/installing/booting/verifying
   useEffect(() => {
+    if (!data) return;
+    const isTerminal = data.status === 'Ready' || data.status === 'Stopped' || data.status === 'Failed';
+    const isProvisioningStage =
+      Boolean(data.deploymentStage && data.deploymentStage !== 'vps_ready') && !isTerminal;
+    const isFastPhase =
+      data.status === 'Queued' ||
+      data.status === 'Preparing' ||
+      data.status === 'Downloading Image' ||
+      data.status === 'Creating Disk';
+
     if (
-      data &&
-      (data.ipAddress.includes('...') ||
-        data.status === 'Queued' ||
-        data.status === 'Preparing' ||
-        data.status === 'Downloading Image' ||
-        data.status === 'Creating Disk' ||
-        data.status === 'Installing' ||
-        data.status === 'Booting' ||
-        data.lifecycleState === 'PENDING' ||
-        data.lifecycleState === 'DOWNLOADING_ISO' ||
-        data.lifecycleState === 'PREPARING' ||
-        data.lifecycleState === 'INSTALLING' ||
-        data.lifecycleState === 'REBOOTING' ||
-        data.lifecycleState === 'BOOTING' ||
-        data.lifecycleState === 'CONFIGURING_NETWORK' ||
-        data.lifecycleState === 'CONFIGURING_RDP' ||
-        data.lifecycleState === 'VERIFYING')
+      isProvisioningStage ||
+      data.ipAddress.includes('...') ||
+      isFastPhase ||
+      data.status === 'Installing' ||
+      data.status === 'Booting' ||
+      data.lifecycleState === 'PENDING' ||
+      data.lifecycleState === 'DOWNLOADING_ISO' ||
+      data.lifecycleState === 'PREPARING' ||
+      data.lifecycleState === 'INSTALLING' ||
+      data.lifecycleState === 'REBOOTING' ||
+      data.lifecycleState === 'BOOTING' ||
+      data.lifecycleState === 'CONFIGURING_NETWORK' ||
+      data.lifecycleState === 'CONFIGURING_RDP' ||
+      data.lifecycleState === 'VERIFYING'
     ) {
       const timer = setTimeout(() => {
         fetchConnection();
         fetchVms();
-      }, 2500);
+      }, isFastPhase ? 1500 : 2500);
       return () => clearTimeout(timer);
     }
   }, [data]);
@@ -231,7 +255,9 @@ export default function App() {
     }
   };
 
-  const handleVmAction = async (action: 'start' | 'restart' | 'shutdown' | 'force-stop' | 'rebuild' | 'delete') => {
+  const handleVmAction = async (
+    action: 'start' | 'restart' | 'shutdown' | 'force-stop' | 'rebuild' | 'delete' | 'retry'
+  ) => {
     if (!data?.vmId) return;
     setActionLoading(true);
     try {
@@ -344,7 +370,10 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setIsCreateModalOpen(true)}
+              onClick={() => {
+                setCreateModalInitialOs('windows-7');
+                setIsCreateModalOpen(true);
+              }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2f8bff] hover:bg-[#2573d9] text-white text-xs font-semibold shadow-md shadow-[#2f8bff]/20 transition-colors"
             >
               <Plus className="w-4 h-4" />
@@ -362,6 +391,7 @@ export default function App() {
                 if (matchingVm && matchingVm.id !== data?.vmId) {
                   handleSelectVm(matchingVm.id);
                 } else if (!matchingVm) {
+                  setCreateModalInitialOs(osId);
                   setIsCreateModalOpen(true);
                 }
               }}
@@ -534,6 +564,23 @@ export default function App() {
               )}
             </div>
           </div>
+
+          {/* Real-time 12-stage Deployment Pipeline Progress */}
+          {data?.deploymentStages && data.deploymentStages.length > 0 && (
+            <DeploymentProgressCard
+              vmId={data.vmId}
+              osName={data.osName || currentVm?.osName}
+              status={data.status}
+              deploymentStage={data.deploymentStage}
+              deploymentStages={data.deploymentStages}
+              isoProgress={data.isoProgress}
+              failureReason={data.failureReason}
+              statusMessage={data.statusMessage}
+              remediation={data.remediation}
+              actionLoading={actionLoading}
+              onRetry={() => handleVmAction('retry')}
+            />
+          )}
 
           {/* Honest VM Provisioning Failure or Active Installation Banner */}
           {data?.status === 'Failed' && data?.failureReason && (
@@ -961,7 +1008,7 @@ export default function App() {
           isOpen={isCreateModalOpen}
           onClose={() => setIsCreateModalOpen(false)}
           osList={osList}
-          initialOs={selectedOsFilter}
+          initialOs={createModalInitialOs}
           onVmCreated={() => {
             fetchVms();
             fetchConnection();

@@ -270,6 +270,7 @@ export class HypervisorController {
     baseDiskPath?: string;
     autounattendIsoPath?: string;
     bootFromDiskOnly?: boolean;
+    preferDiskBoot?: boolean;
   }): Promise<VmProcessInfo> {
     const { vmId, osId, hostPort } = options;
     const requestedMemoryMb = options.memoryMb || (osId === 'windows-10' ? 4096 : 2048);
@@ -279,6 +280,7 @@ export class HypervisorController {
     const isoNbdSource = options.isoNbdSource;
     const autounattendIsoPath = options.autounattendIsoPath;
     const bootFromDiskOnly = Boolean(options.bootFromDiskOnly);
+    const preferDiskBoot = Boolean(options.preferDiskBoot);
 
     // If already running (in-memory or orphaned live QMP socket), prevent duplicate QEMU instance
     const current = this.vms.get(vmId);
@@ -514,7 +516,7 @@ export class HypervisorController {
       if (attachInstallerIso && cdromFileSpec) {
         args.push(
           '-drive', `id=cdrom0,file=${cdromFileSpec},format=raw,media=cdrom,readonly=on,if=none`,
-          '-device', 'ide-cd,drive=cdrom0,bus=ahci.1,bootindex=1'
+          '-device', `ide-cd,drive=cdrom0,bus=ahci.1,bootindex=${preferDiskBoot ? 2 : 1}`
         );
         serverLogger.info('Hypervisor', `Attached Windows 10 installation ISO: ${cdromFileSpec}`, vmId);
 
@@ -579,9 +581,9 @@ export class HypervisorController {
         args.push(
           '-drive', `id=cdrom0,file=${cdromFileSpec},format=raw,media=cdrom,readonly=on,if=none`,
           '-device', 'ide-cd,drive=cdrom0,bus=ide.1,unit=0',
-          '-boot', 'once=d,order=cd'
+          '-boot', preferDiskBoot ? 'order=cd' : 'once=d,order=cd'
         );
-        serverLogger.info('Hypervisor', `Attached Windows 7 installation ISO: ${cdromFileSpec}`, vmId);
+        serverLogger.info('Hypervisor', `Attached Windows 7 installation ISO${preferDiskBoot ? ' (disk-first boot)' : ''}: ${cdromFileSpec}`, vmId);
 
         if (autounattendIsoPath && fs.existsSync(autounattendIsoPath)) {
           args.push(

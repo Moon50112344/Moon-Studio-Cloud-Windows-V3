@@ -112,6 +112,11 @@ export function OsSelector({ selectedOs, onSelectOs, osList, disabled = false }:
                       <h3 className="text-base font-bold text-white tracking-tight whitespace-nowrap">
                         {os.name}
                       </h3>
+                      {(os.isDefault || isWin7) && (
+                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[#2f8bff]/20 text-[#2f8bff] border border-[#2f8bff]/40 shrink-0">
+                          Mặc định
+                        </span>
+                      )}
                       <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-[#1e2a44] text-[#8a99ad] shrink-0">
                         {os.arch}
                       </span>

@@ -26,6 +26,7 @@ export interface OsDefinition {
   version: string;
   arch: 'x86_64';
   family: 'linux' | 'windows';
+  isDefault?: boolean;
   description: string;
   supportStatus: 'Active LTS' | 'Active Support' | 'End of Support (EOS)';
   securityWarning?: string;
@@ -91,6 +92,28 @@ export interface ImageStatus {
   remediation?: string;
 }
 
+export interface EnsureProgressDetail {
+  percent: number;
+  stage: 'checking_cache' | 'downloading' | 'verifying' | 'cached' | 'ready';
+  message: string;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  provider?: string;
+  edition?: string;
+  cachedReused?: boolean;
+  checksumVerified?: boolean;
+}
+
+export interface EnsureImageResult {
+  path: string;
+  cachedReused: boolean;
+  checksumVerified: boolean;
+  sizeBytes: number;
+  sha256Actual?: string;
+  provider?: string;
+  edition?: string;
+}
+
 const MIN_GENUINE_WINDOWS_ISO_BYTES = 500 * 1024 * 1024; // 500 MiB minimum for real Windows installer ISO
 const MIN_GENUINE_WINDOWS_DISK_BYTES = 1200 * 1024 * 1024; // ~1.2 GiB minimum for zstd-compressed installed Windows QCOW2
 
@@ -102,7 +125,8 @@ export class ImageManager {
   private imageStates: Map<SupportedOsId, ImageStatus> = new Map();
   private downloadProgress: Map<SupportedOsId, { percent: number; downloadedBytes: number; totalBytes: number; provider: string; stage?: 'downloading' | 'verifying' }> = new Map();
   private isoMetadata: Map<SupportedOsId, IsoMetadataEntry> = new Map();
-  private inflightEnsures: Map<SupportedOsId, Promise<string>> = new Map();
+  private inflightEnsures: Map<SupportedOsId, Promise<EnsureImageResult>> = new Map();
+  private intentionalCleanupAborts: Set<SupportedOsId> = new Set();
 
   constructor() {
     this.isoDir = path.resolve(process.cwd(), 'data/iso');
@@ -115,6 +139,32 @@ export class ImageManager {
       // ignore
     }
     this.loadIsoMetadata();
+
+    // Default OS: Windows 7 SP1 x64
+    this.catalog.set('windows-7', {
+      id: 'windows-7',
+      name: 'Windows 7',
+      version: 'Windows 7 SP1 Ultimate (x64)',
+      arch: 'x86_64',
+      family: 'windows',
+      isDefault: true,
+      description: 'Hệ điều hành Windows 7 SP1 (64-bit) thật trên QEMU SeaBIOS + IDE, tự động tải & xác minh ISO khi triển khai VPS.',
+      supportStatus: 'End of Support (EOS)',
+      securityWarning: 'Microsoft đã chính thức kết thúc hỗ trợ và cập nhật bảo mật cho Windows 7. Khuyến nghị chạy trong mạng cô lập hoặc kiểm thử phần mềm cũ.',
+      isoFileName: 'windows-7-sp1-x64.iso',
+      defaultUsername: 'Administrator',
+      minRamMb: 1024,
+      minDiskGb: 40,
+      recommendedRamMb: 1024,
+      recommendedCores: 2,
+      firmware: 'SeaBIOS',
+      hypervisorProfile: {
+        chipset: 'i440fx (Legacy PC)',
+        diskBus: 'IDE',
+        nic: 'Intel e1000',
+        vga: 'Standard VGA',
+      },
+    });
 
     this.catalog.set('debian-12', {
       id: 'debian-12',
@@ -158,30 +208,6 @@ export class ImageManager {
         chipset: 'Intel Q35 + UEFI OVMF + TPM 2.0',
         diskBus: 'AHCI SATA (qcow2)',
         nic: 'Intel e1000e',
-        vga: 'Standard VGA',
-      },
-    });
-
-    this.catalog.set('windows-7', {
-      id: 'windows-7',
-      name: 'Windows 7',
-      version: 'Windows 7 SP1 Ultimate (x64)',
-      arch: 'x86_64',
-      family: 'windows',
-      description: 'Hệ điều hành Windows 7 SP1 (64-bit) cổ điển, tương thích ứng dụng legacy với phần cứng chuẩn PC/IDE.',
-      supportStatus: 'End of Support (EOS)',
-      securityWarning: 'Microsoft đã chính thức kết thúc hỗ trợ và cập nhật bảo mật cho Windows 7. Khuyến nghị chạy trong mạng cô lập hoặc kiểm thử phần mềm cũ.',
-      isoFileName: 'windows-7-sp1-x64.iso',
-      defaultUsername: 'Administrator',
-      minRamMb: 1024,
-      minDiskGb: 40,
-      recommendedRamMb: 2048,
-      recommendedCores: 2,
-      firmware: 'SeaBIOS',
-      hypervisorProfile: {
-        chipset: 'i440fx (Legacy PC)',
-        diskBus: 'IDE',
-        nic: 'Intel e1000',
         vga: 'Standard VGA',
       },
     });
@@ -553,11 +579,20 @@ export class ImageManager {
     return Array.from(this.imageStates.values());
   }
 
-  public abortActiveDownload(osId: SupportedOsId): boolean {
-    const aborted = dockurEngine.abortDownload(osId);
+  public abortActiveDownload(osId: SupportedOsId, options?: { removePartial?: boolean }): boolean {
+    if (options?.removePartial) {
+      this.intentionalCleanupAborts.add(osId);
+    }
+    const aborted = dockurEngine.abortDownload(osId, options);
     if (aborted) {
       this.downloadProgress.delete(osId);
+      if (options?.removePartial) {
+        this.isoMetadata.delete(osId);
+        this.saveIsoMetadata();
+      }
       this.refreshImageStatuses();
+    } else if (options?.removePartial) {
+      this.intentionalCleanupAborts.delete(osId);
     }
     return aborted;
   }
@@ -635,7 +670,7 @@ export class ImageManager {
   public deleteCachedIso(osId: SupportedOsId): boolean {
     if (osId === 'debian-12') return false;
     if (dockurEngine.isDownloading(osId)) {
-      this.abortActiveDownload(osId);
+      this.abortActiveDownload(osId, { removePartial: true });
     }
     const filePath = this.resolveIsoPath(osId);
     const partialPath = `${filePath}.downloading`;
@@ -707,13 +742,23 @@ export class ImageManager {
     osId: SupportedOsId,
     onProgress?: (progress: number, stage: string) => void
   ): Promise<string> {
+    const result = await this.ensureImageReadyWithMeta(osId, (detail) => {
+      onProgress?.(detail.percent, detail.message);
+    });
+    return result.path;
+  }
+
+  public async ensureImageReadyWithMeta(
+    osId: SupportedOsId,
+    onDetail?: (detail: EnsureProgressDetail) => void
+  ): Promise<EnsureImageResult> {
     const existingEnsure = this.inflightEnsures.get(osId);
     if (existingEnsure) {
       serverLogger.info('ImageManager', `Deduplicating concurrent media check/download for ${osId}.`);
       return existingEnsure;
     }
 
-    const promise = this.ensureImageReadyInternal(osId, onProgress).finally(() => {
+    const promise = this.ensureImageReadyInternal(osId, onDetail).finally(() => {
       if (this.inflightEnsures.get(osId) === promise) {
         this.inflightEnsures.delete(osId);
       }
@@ -724,8 +769,8 @@ export class ImageManager {
 
   private async ensureImageReadyInternal(
     osId: SupportedOsId,
-    onProgress?: (progress: number, stage: string) => void
-  ): Promise<string> {
+    onDetail?: (detail: EnsureProgressDetail) => void
+  ): Promise<EnsureImageResult> {
     const def = this.catalog.get(osId);
     if (!def) {
       throw new Error(`Unsupported OS ID: ${osId}. Supported OS IDs are 'debian-12', 'windows-10', and 'windows-7'.`);
@@ -750,9 +795,20 @@ export class ImageManager {
         isoBuffer[termOffset + 6] = 0x01;
         fs.writeFileSync(filePath, isoBuffer);
       }
-      onProgress?.(100, 'Debian 12 Native Host Ready');
+      onDetail?.({
+        percent: 100,
+        stage: 'ready',
+        message: 'Debian 12 Native Host Ready',
+        cachedReused: true,
+        checksumVerified: true,
+      });
       this.refreshImageStatuses();
-      return filePath;
+      return {
+        path: filePath,
+        cachedReused: true,
+        checksumVerified: true,
+        sizeBytes: fs.existsSync(filePath) ? fs.statSync(filePath).size : 0,
+      };
     }
 
     // Windows 10 & Windows 7: check pre-installed genuine QCOW2 first
@@ -761,14 +817,74 @@ export class ImageManager {
       const diskCheck = this.validateInstalledDiskImage(baseDisk);
       if (diskCheck.valid) {
         serverLogger.info('ImageManager', `Verified pre-installed ${def.name} base disk: ${baseDisk}`);
-        onProgress?.(100, `${def.name} Disk Image Verified`);
+        onDetail?.({
+          percent: 100,
+          stage: 'cached',
+          message: `${def.name} Disk Image Verified`,
+          downloadedBytes: diskCheck.sizeBytes,
+          totalBytes: diskCheck.sizeBytes,
+          cachedReused: true,
+          checksumVerified: true,
+        });
         this.refreshImageStatuses();
-        return baseDisk;
+        return {
+          path: baseDisk,
+          cachedReused: true,
+          checksumVerified: true,
+          sizeBytes: diskCheck.sizeBytes,
+        };
       }
     }
 
+    onDetail?.({
+      percent: 0,
+      stage: 'checking_cache',
+      message: `Đang kiểm tra bộ nhớ đệm ISO cho ${def.name}...`,
+    });
+
     // Check locally cached genuine ISO
     let check = this.validateWindowsIsoMedia(filePath);
+    if (check.valid) {
+      // Reuse existing verified ISO without re-downloading
+      let meta = this.isoMetadata.get(osId);
+      if (!meta?.checksumVerified || !meta?.sha256Actual) {
+        onDetail?.({
+          percent: 99,
+          stage: 'verifying',
+          message: `Đang kiểm tra mã băm SHA-256 cho ${def.name} ISO đã lưu...`,
+          downloadedBytes: check.sizeBytes,
+          totalBytes: check.sizeBytes,
+          cachedReused: true,
+        });
+        await this.verifyLocalIso(osId);
+        meta = this.isoMetadata.get(osId);
+        check = this.validateWindowsIsoMedia(filePath);
+      }
+      if (check.valid && meta?.checksumStatus !== 'MISMATCH') {
+        const verified = Boolean(meta?.checksumVerified);
+        onDetail?.({
+          percent: 100,
+          stage: 'cached',
+          message: `Tái sử dụng ${def.name} ISO đã xác minh trong bộ nhớ đệm (${(check.sizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GiB)`,
+          downloadedBytes: check.sizeBytes,
+          totalBytes: check.sizeBytes,
+          provider: meta?.edition || `Cached ${def.name} ISO`,
+          edition: meta?.edition,
+          cachedReused: true,
+          checksumVerified: verified,
+        });
+        this.refreshImageStatuses();
+        return {
+          path: filePath,
+          cachedReused: true,
+          checksumVerified: verified,
+          sizeBytes: check.sizeBytes,
+          sha256Actual: meta?.sha256Actual,
+          edition: meta?.edition,
+        };
+      }
+    }
+
     if (!check.valid) {
       if (fs.existsSync(filePath)) {
         serverLogger.warn('ImageManager', `Removing invalid/incomplete ISO at ${filePath} before auto-download...`);
@@ -790,12 +906,21 @@ export class ImageManager {
           });
           const dlMb = (dl.downloadedBytes / (1024 * 1024)).toFixed(0);
           const totalMb = (dl.totalBytes / (1024 * 1024)).toFixed(0);
-          onProgress?.(
-            dl.percent,
-            dl.stage === 'verifying'
-              ? `Đang kiểm tra mã băm SHA-256 cho ${def.name} ISO...`
-              : `Đang tự động tải ${def.name} ISO qua dockurr/windows (${dlMb}/${totalMb} MB — ${dl.percent}%)`
-          );
+          const stage: EnsureProgressDetail['stage'] = dl.stage === 'verifying' ? 'verifying' : 'downloading';
+          onDetail?.({
+            percent: dl.percent,
+            stage,
+            message:
+              stage === 'verifying'
+                ? `Đang kiểm tra mã băm SHA-256 cho ${def.name} ISO...`
+                : `Đang tự động tải ${def.name} ISO qua dockurr/windows (${dlMb}/${totalMb} MB — ${dl.percent}%)`,
+            downloadedBytes: dl.downloadedBytes,
+            totalBytes: dl.totalBytes,
+            provider: dl.provider,
+            edition: dl.edition,
+            cachedReused: false,
+            checksumVerified: false,
+          });
           this.refreshImageStatuses();
         });
 
@@ -810,6 +935,12 @@ export class ImageManager {
         });
         this.saveIsoMetadata();
       } catch (err) {
+        if (this.intentionalCleanupAborts.delete(osId)) {
+          this.isoMetadata.delete(osId);
+          this.saveIsoMetadata();
+          this.refreshImageStatuses();
+          throw err;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         this.isoMetadata.set(osId, {
           ...this.isoMetadata.get(osId),
@@ -832,13 +963,32 @@ export class ImageManager {
       throw new Error(errMsg);
     }
 
+    const finalMeta = this.isoMetadata.get(osId);
+    const verified = Boolean(finalMeta?.checksumVerified);
     serverLogger.info(
       'ImageManager',
       `Verified genuine ${def.name} ISO media: ${filePath} (${(check.sizeBytes / (1024 * 1024)).toFixed(1)} MiB)`
     );
-    onProgress?.(100, `${def.name} Media Verified`);
+    onDetail?.({
+      percent: 100,
+      stage: 'ready',
+      message: `${def.name} Media Verified`,
+      downloadedBytes: check.sizeBytes,
+      totalBytes: check.sizeBytes,
+      provider: finalMeta?.edition,
+      edition: finalMeta?.edition,
+      cachedReused: false,
+      checksumVerified: verified,
+    });
     this.refreshImageStatuses();
-    return filePath;
+    return {
+      path: filePath,
+      cachedReused: false,
+      checksumVerified: verified,
+      sizeBytes: check.sizeBytes,
+      sha256Actual: finalMeta?.sha256Actual,
+      edition: finalMeta?.edition,
+    };
   }
 }
 

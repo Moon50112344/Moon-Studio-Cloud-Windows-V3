@@ -120,6 +120,13 @@ function createBotTestVmAdapter(options?: {
       if (vm) vm.name = newName;
       return vm;
     },
+    retryVmProvisioning: async (id) => {
+      const vm = vms.get(id);
+      if (!vm) return null;
+      vm.status = 'Ready';
+      vm.deploymentStage = 'vps_ready';
+      return vm;
+    },
   };
 }
 
@@ -761,7 +768,36 @@ test('Discord Bot handles async provisioning, channel failure isolation, provisi
     assert.equal(provFailMock.getLastEmbedJson().title, 'VPS Provisioning Failed');
     assert.ok(JSON.stringify(provFailMock.getLastEmbedJson()).includes('Guest OS password sync failed'));
 
-    // 5. RdpServiceManager rejects invalid username / empty password in strict mode without modifying OS
+    // 5. /create-vps without os option defaults to Windows 7 and /vps-power retry succeeds
+    simulateFailureNext = false;
+    const freshDefaultUser = '755555555555555555';
+    const defaultUserMock = createMockInteraction({
+      commandName: 'create-vps',
+      userId: freshDefaultUser,
+      username: 'default_win7_user',
+      displayName: 'Default Win7 User',
+      strings: { name: 'Auto-Win7-VPS' },
+      forbiddenSecret: secret,
+    });
+    await ctx.handleInteraction(defaultUserMock.interaction);
+    assert.equal(defaultUserMock.publicMessages.length, 1);
+    assert.ok(JSON.stringify(defaultUserMock.getLastPublicEmbedJson()).includes('Windows 7'));
+    assert.equal(defaultUserMock.getLastEmbedJson().title, 'Your Moon Studio VPS Credentials');
+    const createdDefaultVpsId = (defaultUserMock.getLastEmbedJson().fields as Array<{ name: string; value: string }>)
+      .find((f) => f.name === 'VPS ID')!
+      .value.replace(/`/g, '')
+      .trim();
+
+    const retryPowerMock = createMockInteraction({
+      commandName: 'vps-power',
+      userId: freshDefaultUser,
+      strings: { vps_id: createdDefaultVpsId, action: 'retry' },
+    });
+    await ctx.handleInteraction(retryPowerMock.interaction);
+    assert.ok(String(retryPowerMock.getLastEmbedJson().title).includes('VPS Action Executed'));
+    assert.ok(JSON.stringify(retryPowerMock.getLastEmbedJson()).includes('retry'));
+
+    // 6. RdpServiceManager rejects invalid username / empty password in strict mode without modifying OS
     const rdp = new RdpServiceManager();
     await assert.rejects(
       () => rdp.ensureRdpServerRunning('bad user!', 'Secret123!', { strictPasswordSync: true }),
@@ -776,3 +812,4 @@ test('Discord Bot handles async provisioning, channel failure isolation, provisi
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+

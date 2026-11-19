@@ -1,12 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEPLOYMENT_STAGE_ORDER,
+  calculateDeploymentOverallPercent,
   calculateSafeVmMemoryBudget,
   classifyQemuExitCause,
+  createInitialDeploymentStages,
   evaluateIsoChecksum,
+  getActiveDeploymentStageKey,
   getLifecycleDisplayInfo,
   mapVmStatusToLifecycleState,
   parseCgroupOomControl,
+  updateDeploymentStage,
 } from './win7Lifecycle';
 
 test('mapVmStatusToLifecycleState maps all lifecycle stages accurately while preserving VmExtendedStatus compatibility', () => {
@@ -153,3 +158,57 @@ test('calculateSafeVmMemoryBudget permits Windows 10 2048 MiB on idle 12 GiB con
     assert.equal(info.label, state);
   }
 });
+
+test('12-stage deployment helpers track stages, skipped cached ISO, and reservedIsoDownloadMb step-down', () => {
+  assert.equal(DEPLOYMENT_STAGE_ORDER.length, 12);
+  assert.equal(calculateDeploymentOverallPercent(createInitialDeploymentStages('pending')), 0);
+  let stages = createInitialDeploymentStages('active');
+  assert.equal(stages.length, 12);
+  assert.equal(getActiveDeploymentStageKey(stages), 'creating_vps');
+  assert.equal(calculateDeploymentOverallPercent(stages), 3);
+
+  stages = updateDeploymentStage(stages, 'creating_vps', 'completed', 'Created');
+  stages = updateDeploymentStage(stages, 'allocating_resources', 'completed', '1024 MiB');
+  stages = updateDeploymentStage(stages, 'preparing_storage', 'completed');
+  stages = updateDeploymentStage(stages, 'downloading_iso', 'active', '50%');
+  assert.equal(getActiveDeploymentStageKey(stages), 'downloading_iso');
+
+  const midPercent = calculateDeploymentOverallPercent(stages, {
+    status: 'downloading',
+    downloadedBytes: 500,
+    totalBytes: 1000,
+    percent: 50,
+    cachedReused: false,
+    checksumVerified: false,
+    resumable: true,
+  });
+  assert.ok(midPercent > 25 && midPercent < 40, `Expected mid-download percent around 29%, got ${midPercent}`);
+
+  // Cached ISO skips downloading_iso cleanly and counts toward completion
+  let cachedStages = updateDeploymentStage(stages, 'downloading_iso', 'skipped', 'Cached ISO reused');
+  cachedStages = updateDeploymentStage(cachedStages, 'verifying_iso', 'completed', 'SHA-256 OK');
+  for (const key of DEPLOYMENT_STAGE_ORDER) {
+    const st = cachedStages.find((s) => s.key === key);
+    if (st && st.status === 'pending') {
+      cachedStages = updateDeploymentStage(cachedStages, key, 'completed');
+    }
+  }
+  assert.equal(calculateDeploymentOverallPercent(cachedStages), 100);
+
+  // reservedIsoDownloadMb reduces 1024 -> 768 MiB when memory-backed overlay headroom is tight
+  const stepDownWin7 = calculateSafeVmMemoryBudget({
+    osId: 'windows-7',
+    requestedMemoryMb: 1024,
+    hostTotalMb: 11960,
+    hostAvailableMb: 10200,
+    isMemoryBackedOverlay: true,
+    existingDiskMb: 0,
+    attachInstallerIso: true,
+    reservedIsoDownloadMb: 3200,
+    otherActiveQemuMb: 0,
+  });
+  assert.equal(stepDownWin7.allowed, true);
+  assert.equal(stepDownWin7.allocatedMemoryMb, 768);
+  assert.equal(stepDownWin7.adjusted, true);
+});
+

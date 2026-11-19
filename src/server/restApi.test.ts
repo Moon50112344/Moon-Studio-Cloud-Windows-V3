@@ -173,6 +173,15 @@ function createMockVmAdapter(behavior?: {
       vm.name = newName;
       return vm;
     },
+    async retryVmProvisioning(id) {
+      const vm = vms.get(id);
+      if (!vm) return null;
+      vm.status = 'Ready';
+      vm.deploymentStage = 'vps_ready';
+      vm.failureReason = undefined;
+      vm.updatedAt = new Date().toISOString();
+      return vm;
+    },
   };
 }
 
@@ -645,3 +654,33 @@ test('REST API accepts windows-10 VPS creation and rejects unsupported os_id', a
     await srv.close();
   }
 });
+
+test('REST API defaults omitted os_id in POST /api/v1/vps to windows-7 and supports retry without duplicate VPS', async () => {
+  const srv = await setupTestServer({ initialStatus: 'Failed', failMessage: 'ISO mirror timeout' });
+  const ownerId = '444444444444444444';
+
+  try {
+    const createRes = await srv.signedFetch('POST', '/api/v1/vps', ownerId, {
+      name: 'Default-Win7-VPS',
+    });
+    assert.equal(createRes.status, 201);
+    const vps = createRes.json?.vps as Record<string, unknown>;
+    assert.equal(vps.os_id, 'windows-7');
+    assert.equal(vps.os_name, 'Windows 7');
+    const vpsId = String(vps.vps_id);
+
+    const retryRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/retry`, ownerId);
+    assert.equal(retryRes.status, 200);
+    const retried = retryRes.json?.vps as Record<string, unknown>;
+    assert.equal(retried.vps_id, vpsId);
+    assert.equal(retried.status, 'Ready');
+    assert.equal(retried.deployment_stage, 'vps_ready');
+
+    const listRes = await srv.signedFetch('GET', '/api/v1/vps', ownerId);
+    assert.equal(listRes.status, 200);
+    assert.equal((listRes.json?.vps_list as unknown[]).length, 1, 'Retry must not create a duplicate VPS');
+  } finally {
+    await srv.close();
+  }
+});
+

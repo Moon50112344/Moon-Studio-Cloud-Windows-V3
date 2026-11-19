@@ -46,6 +46,7 @@ export interface VmLifecycleAdapter {
   forceStopVm(vmId: string): Promise<boolean>;
   deleteVm(vmId: string): Promise<boolean>;
   rebuildVm(vmId: string): Promise<VmRecord | null>;
+  retryVmProvisioning?(vmId: string): Promise<VmRecord | null>;
   reloadIp(vmId?: string): Promise<{
     success: boolean;
     vm: VmRecord;
@@ -116,6 +117,11 @@ function formatVpsResponse(
     public_announcement_sent: Boolean(vps.public_announcement_sent),
     ephemeral_delivered: Boolean(vps.ephemeral_delivered),
     ephemeral_failed: Boolean(vps.ephemeral_failed),
+    deployment_stage: liveVm?.deploymentStage || null,
+    deployment_stages: liveVm?.deploymentStages || null,
+    iso_progress: liveVm?.isoProgress || null,
+    deployment_started_at: liveVm?.deploymentStartedAt || null,
+    deployment_completed_at: liveVm?.deploymentCompletedAt || null,
   };
 }
 
@@ -403,12 +409,13 @@ export function createManagementRouter(deps: {
       });
     }
 
-    const osId = (body.os_id || body.osId) as SupportedOsId;
+    const rawOsId = body.os_id !== undefined ? body.os_id : body.osId;
+    const osId = (rawOsId === undefined || rawOsId === null || rawOsId === '' ? 'windows-7' : rawOsId) as SupportedOsId;
     if (!isSupportedOsId(osId)) {
       return res.status(400).json({
         success: false,
         code: 'INVALID_OS',
-        error: "os_id is required and must be 'debian-12', 'windows-10', or 'windows-7'.",
+        error: "os_id must be 'windows-7', 'windows-10', or 'debian-12'.",
       });
     }
 
@@ -704,14 +711,14 @@ export function createManagementRouter(deps: {
       });
     }
 
-    const allowedActions = new Set(['start', 'stop', 'shutdown', 'restart', 'force-stop', 'rebuild', 'reload-ip']);
+    const allowedActions = new Set(['start', 'stop', 'shutdown', 'restart', 'force-stop', 'rebuild', 'retry', 'reload-ip']);
     const action = typeof body.action === 'string' ? body.action.trim().toLowerCase() : undefined;
 
     if (action && !allowedActions.has(action)) {
       return res.status(400).json({
         success: false,
         code: 'INVALID_ACTION',
-        error: `Invalid action '${action}'. Allowed: start, stop, shutdown, restart, force-stop, rebuild, reload-ip.`,
+        error: `Invalid action '${action}'. Allowed: start, stop, shutdown, restart, force-stop, rebuild, retry, reload-ip.`,
       });
     }
 
@@ -752,6 +759,13 @@ export function createManagementRouter(deps: {
           case 'rebuild':
             await vmAdapter.rebuildVm(vpsId);
             break;
+          case 'retry':
+            if (vmAdapter.retryVmProvisioning) {
+              await vmAdapter.retryVmProvisioning(vpsId);
+            } else {
+              await vmAdapter.rebuildVm(vpsId);
+            }
+            break;
           case 'reload-ip': {
             const reloaded = await vmAdapter.reloadIp(vpsId);
             actionResult = {
@@ -783,7 +797,7 @@ export function createManagementRouter(deps: {
   });
 
   // Convenience power/network lifecycle endpoints (owner or admin only)
-  for (const action of ['start', 'stop', 'shutdown', 'restart', 'reload-ip'] as const) {
+  for (const action of ['start', 'stop', 'shutdown', 'restart', 'retry', 'reload-ip'] as const) {
     router.post(`/vps/:vpsId/${action}`, authMiddleware, ensureAuthenticatedUser, async (req: Request, res: Response) => {
       const auth = req.discordAuth!;
       const vpsId = req.params.vpsId;
@@ -810,7 +824,10 @@ export function createManagementRouter(deps: {
         if (action === 'start') await vmAdapter.startVm(vpsId);
         else if (action === 'stop' || action === 'shutdown') await vmAdapter.shutdownVm(vpsId);
         else if (action === 'restart') await vmAdapter.restartVm(vpsId);
-        else if (action === 'reload-ip') {
+        else if (action === 'retry') {
+          if (vmAdapter.retryVmProvisioning) await vmAdapter.retryVmProvisioning(vpsId);
+          else await vmAdapter.rebuildVm(vpsId);
+        } else if (action === 'reload-ip') {
           const reloaded = await vmAdapter.reloadIp(vpsId);
           extra = { old_endpoint: reloaded.oldEndpoint, new_endpoint: reloaded.newEndpoint };
         }

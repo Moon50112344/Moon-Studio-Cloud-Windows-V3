@@ -10,7 +10,13 @@ import { probeHostInfrastructure } from './infrastructure';
 import { generateWindowsPassword, validateWindowsPassword } from '../utils/credentials';
 import { tunnelManager } from './tunnel';
 import { rdpServiceManager } from './rdpService';
-import { imageManager, isSupportedOsId, SupportedOsId } from './imageManager';
+import {
+  EnsureImageResult,
+  EnsureProgressDetail,
+  imageManager,
+  isSupportedOsId,
+  SupportedOsId,
+} from './imageManager';
 import { getDefaultProvisioningPassword } from './credentialPolicy';
 import {
   dockurEngine,
@@ -22,10 +28,16 @@ import {
 } from './dockurEngine';
 import type { NbdSource } from './nbdIsoServer';
 import {
+  DeploymentStageItem,
+  DeploymentStageKey,
+  IsoDownloadProgress,
   VmLifecycleState,
-  mapVmStatusToLifecycleState,
+  createInitialDeploymentStages,
+  getActiveDeploymentStageKey,
   getLifecycleDisplayInfo,
+  mapVmStatusToLifecycleState,
   calculateSafeVmMemoryBudget,
+  updateDeploymentStage,
 } from './win7Lifecycle';
 
 export type VmExtendedStatus =
@@ -84,6 +96,11 @@ export interface VmRecord {
   bootMode?: 'iso' | 'disk';
   hardwareProfile?: Record<string, string>;
   mediaSourceType?: 'iso' | 'installed_disk' | 'native_host';
+  deploymentStage?: DeploymentStageKey;
+  deploymentStages?: DeploymentStageItem[];
+  isoProgress?: IsoDownloadProgress;
+  deploymentStartedAt?: string;
+  deploymentCompletedAt?: string;
 }
 
 export interface VmProvisioningCallbacks {
@@ -204,13 +221,13 @@ export class VmManager {
 
     let vm = this.vms.get(this.primaryVmId);
     if (!vm) {
-      serverLogger.info('VMManager', `No existing primary VM found. Provisioning default Debian 12 VM...`);
+      serverLogger.info('VMManager', `No existing primary VM found. Provisioning default Windows 7 SP1 x64 VM...`);
       vm = await this.createVm({
         id: this.primaryVmId,
-        name: 'Moon Studio Cloud Linux (Debian 12)',
-        osId: 'debian-12',
+        name: 'Moon Studio Cloud Windows 7 (SP1 x64)',
+        osId: 'windows-7',
         cores: 2,
-        memoryMb: 2048,
+        memoryMb: 1024,
         diskGb: 40,
         username: 'Administrator',
       });
@@ -249,6 +266,21 @@ export class VmManager {
     }
 
     this.startBackgroundMonitoring();
+  }
+
+  private setDeploymentStage(
+    vm: VmRecord,
+    stage: DeploymentStageKey,
+    status: DeploymentStageItem['status'],
+    detail?: string,
+    _progressPercent?: number
+  ): void {
+    if (!vm.deploymentStages || vm.deploymentStages.length === 0) {
+      vm.deploymentStages = createInitialDeploymentStages('pending');
+    }
+    vm.deploymentStages = updateDeploymentStage(vm.deploymentStages, stage, status, detail);
+    vm.deploymentStage = getActiveDeploymentStageKey(vm.deploymentStages);
+    vm.updatedAt = new Date().toISOString();
   }
 
   public checkProvisioningPreflight(osId: SupportedOsId, requestedMemoryMb?: number): {
@@ -325,15 +357,17 @@ export class VmManager {
       };
     }
 
-    // With NBD HTTP Range streaming on Cloud Run RAM-backed overlayfs, multi-GB ISO never fills RAM/overlay
-    if (!shouldStreamIsoViaNbd()) {
+    // Windows 7 downloads & caches ISO during deployment (unless WIN7_USE_NBD=1)
+    if (!shouldStreamIsoViaNbd() || osId === 'windows-7') {
       const isoDir = path.resolve(process.cwd(), 'data/iso');
       const availBytes = getAvailableDiskBytes(isoDir);
       const orderedMirrors = getOrderedMirrorsForOs(osId, availBytes);
       const smallestMirror = [...orderedMirrors].sort((a, b) => a.expectedSizeBytes - b.expectedSizeBytes)[0];
-      if (availBytes > 0 && smallestMirror && availBytes < smallestMirror.expectedSizeBytes + 256 * 1024 * 1024) {
+      const alreadyHasPartial = dockurEngine.getPartialDownloadBytes(imageManager.resolveIsoPath(osId));
+      const remainingNeeded = smallestMirror ? Math.max(0, smallestMirror.expectedSizeBytes - alreadyHasPartial) : 0;
+      if (availBytes > 0 && remainingNeeded > 0 && availBytes < remainingNeeded + 256 * 1024 * 1024) {
         const availGib = (availBytes / (1024 * 1024 * 1024)).toFixed(2);
-        const needGib = ((smallestMirror.expectedSizeBytes + 256 * 1024 * 1024) / (1024 * 1024 * 1024)).toFixed(2);
+        const needGib = ((remainingNeeded + 256 * 1024 * 1024) / (1024 * 1024 * 1024)).toFixed(2);
         return {
           ready: false,
           code: 'INSUFFICIENT_DISK_SPACE',
@@ -429,6 +463,17 @@ export class VmManager {
 
     const realIp = '159.223.110.159';
     const now = new Date().toISOString();
+    const initialStages = updateDeploymentStage(
+      createInitialDeploymentStages('pending'),
+      'creating_vps',
+      'active',
+      `Khởi tạo ${osDef.name} VPS (${cores} vCPU, ${memoryMb} MB RAM, ${diskGb} GB disk)`
+    );
+    const partialBytes =
+      options.osId === 'windows-7' || options.osId === 'windows-10'
+        ? dockurEngine.getPartialDownloadBytes(imageManager.resolveIsoPath(options.osId))
+        : 0;
+
     const record: VmRecord = {
       id: vmId,
       name,
@@ -463,6 +508,19 @@ export class VmManager {
       isApiManaged,
       credentialsConfigured: false,
       installCompleted: false,
+      deploymentStage: 'creating_vps',
+      deploymentStages: initialStages,
+      deploymentStartedAt: now,
+      isoProgress:
+        options.osId === 'windows-7' || options.osId === 'windows-10'
+          ? {
+              status: 'idle',
+              percent: 0,
+              downloadedBytes: partialBytes,
+              totalBytes: 0,
+              resumable: partialBytes > 0,
+            }
+          : undefined,
     };
 
     this.vms.set(vmId, record);
@@ -474,6 +532,55 @@ export class VmManager {
     });
 
     return record;
+  }
+
+  public async retryVmProvisioning(vmId: string): Promise<VmRecord | null> {
+    if (this.vmLocks.has(vmId)) return null;
+    const vm = this.vms.get(vmId);
+    if (!vm) return null;
+    if (vm.status === 'Ready' || vm.status === 'Running') {
+      return vm;
+    }
+
+    const partialBytes =
+      vm.osId === 'windows-7' || vm.osId === 'windows-10'
+        ? dockurEngine.getPartialDownloadBytes(imageManager.resolveIsoPath(vm.osId))
+        : 0;
+
+    delete vm.failureReason;
+    delete vm.oomDetected;
+    delete vm.remediation;
+    delete vm.deploymentCompletedAt;
+    vm.isExternalVerified = false;
+    vm.status = 'Queued';
+    this.syncVmLifecycle(vm, 'PENDING');
+    vm.deploymentStages = createInitialDeploymentStages('pending');
+    this.setDeploymentStage(
+      vm,
+      'creating_vps',
+      'completed',
+      partialBytes > 0
+        ? `Thử lại triển khai (tiếp tục tải ISO từ ${(partialBytes / (1024 * 1024)).toFixed(1)} MiB)`
+        : 'Đang thử lại quá trình triển khai VPS'
+    );
+    vm.isoProgress =
+      vm.osId === 'windows-7' || vm.osId === 'windows-10'
+        ? {
+            status: 'idle',
+            percent: 0,
+            downloadedBytes: partialBytes,
+            totalBytes: vm.isoProgress?.totalBytes || 0,
+            resumable: partialBytes > 0,
+          }
+        : undefined;
+    vm.statusMessage = 'Đang thử lại triển khai máy ảo (giữ nguyên tiến trình tải ISO đã có)...';
+    vm.updatedAt = new Date().toISOString();
+    this.saveState();
+
+    this.executeProvisioningPipeline(vmId).catch((err) => {
+      serverLogger.error('Provisioner', `Retry pipeline failed for VM ${vmId}: ${err}`, vmId);
+    });
+    return vm;
   }
 
   /**
@@ -557,17 +664,24 @@ export class VmManager {
 
   private async resolveWindowsBootMedia(
     vm: VmRecord,
-    onProgress?: (pct: number, stageMsg: string) => void
+    onDetail?: (detail: EnsureProgressDetail) => void
   ): Promise<{
     baseDiskPath?: string;
     isoPath?: string;
     isoNbdSource?: NbdSource;
     wimIndex: number;
+    ensureResult?: EnsureImageResult;
   }> {
     const winOsId = vm.osId === 'windows-10' ? 'windows-10' : 'windows-7';
     const baseDisk = imageManager.resolvePreinstalledDiskPath(vm.osId);
     if (baseDisk && imageManager.validateInstalledDiskImage(baseDisk).valid) {
-      onProgress?.(100, `${vm.osName} Disk Image Verified`);
+      onDetail?.({
+        percent: 100,
+        stage: 'cached',
+        message: `${vm.osName} Disk Image Verified`,
+        cachedReused: true,
+        checksumVerified: true,
+      });
       return { baseDiskPath: baseDisk, wimIndex: winOsId === 'windows-7' ? 4 : 1 };
     }
 
@@ -577,7 +691,11 @@ export class VmManager {
       detectedWimIndex = resolvePreferredWimImageIndex(localIsoPath, winOsId);
     }
 
-    if (shouldStreamIsoViaNbd()) {
+    // Requirement 2: Windows 7 always caches, verifies SHA-256, and attaches real local ISO unless WIN7_USE_NBD=1.
+    const useNbdStreaming =
+      winOsId === 'windows-10' ? shouldStreamIsoViaNbd() : process.env.WIN7_USE_NBD === '1';
+
+    if (useNbdStreaming) {
       const nbdResolved = await imageManager.resolveNbdIsoSource(winOsId);
       if (nbdResolved) {
         if (fs.existsSync(localIsoPath)) {
@@ -594,7 +712,16 @@ export class VmManager {
             // ignore
           }
         }
-        onProgress?.(100, `Sẵn sàng stream ${nbdResolved.edition} qua NBD (~64 MiB RAM cache)`);
+        onDetail?.({
+          percent: 100,
+          stage: 'ready',
+          message: `Sẵn sàng stream ${nbdResolved.edition} qua NBD (~64 MiB RAM cache)`,
+          provider: nbdResolved.provider,
+          edition: nbdResolved.edition,
+          totalBytes: nbdResolved.totalSizeBytes,
+          cachedReused: false,
+          checksumVerified: false,
+        });
         return {
           isoNbdSource: {
             type: 'http',
@@ -608,13 +735,15 @@ export class VmManager {
       }
     }
 
-    const mediaPath = await imageManager.ensureImageReady(vm.osId, onProgress);
+    const ensureResult = await imageManager.ensureImageReadyWithMeta(vm.osId, onDetail);
+    const mediaPath = ensureResult.path;
     if (mediaPath.endsWith('.qcow2')) {
-      return { baseDiskPath: mediaPath, wimIndex: detectedWimIndex };
+      return { baseDiskPath: mediaPath, wimIndex: detectedWimIndex, ensureResult };
     }
     return {
       isoPath: mediaPath,
       wimIndex: resolvePreferredWimImageIndex(mediaPath, winOsId),
+      ensureResult,
     };
   }
 
@@ -661,52 +790,247 @@ export class VmManager {
     const isWindows = vm.osId === 'windows-10' || vm.osId === 'windows-7';
 
     try {
-      // 1. Preparing
+      // Stage 1: Creating VPS -> completed
+      if (!this.vms.has(vmId)) return;
+      this.setDeploymentStage(vm, 'creating_vps', 'completed', `VPS ${vm.id} đã khởi tạo bản ghi`);
+
+      // Stage 2: Allocating CPU & RAM (Preflight safety check)
       if (!this.vms.has(vmId)) return;
       vm.status = 'Preparing';
       delete vm.oomDetected;
       delete vm.remediation;
       this.syncVmLifecycle(vm, 'PREPARING');
-      vm.statusMessage = 'Đang kiểm tra tài nguyên và chuẩn bị môi trường máy chủ...';
+      this.setDeploymentStage(
+        vm,
+        'allocating_resources',
+        'active',
+        `Cấp phát ${vm.cores} vCPU & ${vm.memoryMb} MB RAM`
+      );
+      vm.statusMessage = 'Đang cấp phát CPU, RAM và kiểm tra an toàn tài nguyên host...';
       vm.updatedAt = new Date().toISOString();
       this.saveState();
-      serverLogger.info('Provisioner', `[Stage 1/5] Preparing environment for ${vm.name}...`, vmId);
-      await new Promise((r) => setTimeout(r, 300));
+      serverLogger.info('Provisioner', `[Stage 1-2] Allocating CPU/RAM for ${vm.name}...`, vmId);
 
-      // 2. Auto-Download & Verify Genuine Installation Media (via dockurr/windows NBD stream on Cloud Run or local cache)
-      if (!this.vms.has(vmId)) return;
-      vm.status = 'Downloading Image';
-      this.syncVmLifecycle(vm, 'DOWNLOADING_ISO');
-      vm.statusMessage = isWindows
-        ? `Đang tự động chuẩn bị nguồn ${vm.osName} ISO qua dockurr/windows...`
-        : `Đang xác minh nguồn cài đặt gốc cho hệ điều hành ${vm.osName}...`;
-      this.saveState();
-      serverLogger.info('Provisioner', `[Stage 2/5] Resolving installation media for ${vm.osId}...`, vmId);
+      const preflight = this.checkProvisioningPreflight(vm.osId, vm.memoryMb);
+      if (!preflight.ready) {
+        if (preflight.remediation) vm.remediation = preflight.remediation;
+        throw new Error(preflight.error || `Resource preflight check failed (${preflight.code || 'BLOCKED'}).`);
+      }
+      if (preflight.allocatedMemoryMb && preflight.allocatedMemoryMb !== vm.memoryMb) {
+        vm.memoryMb = preflight.allocatedMemoryMb;
+      }
+      this.setDeploymentStage(
+        vm,
+        'allocating_resources',
+        'completed',
+        `${vm.cores} vCPU • ${vm.memoryMb} MB RAM`
+      );
+
+      // Stages 3-7 in parallel:
+      // Branch A: ISO cache check / immediate download / SHA-256 verification
+      // Branch B: Preparing storage + QEMU toolchain + creating QCOW2 virtual disk
       let lastSavedProgressAt = 0;
-      const progressCb = (_pct: number, stageMsg: string) => {
-        if (!this.vms.has(vmId)) return;
-        vm.status = 'Downloading Image';
-        this.syncVmLifecycle(vm, 'DOWNLOADING_ISO');
-        vm.statusMessage = stageMsg;
-        vm.updatedAt = new Date().toISOString();
-        if (Date.now() - lastSavedProgressAt > 8000) {
-          lastSavedProgressAt = Date.now();
-          this.saveState();
-        }
-      };
 
-      let resolvedMedia: {
+      const isoTask = async (): Promise<{
         baseDiskPath?: string;
         isoPath?: string;
         isoNbdSource?: NbdSource;
         wimIndex: number;
+      }> => {
+        if (!this.vms.has(vmId)) {
+          return { wimIndex: 1 };
+        }
+        if (!isWindows) {
+          this.setDeploymentStage(vm, 'downloading_iso', 'skipped', 'Debian 12 chạy trực tiếp trên host container');
+          this.setDeploymentStage(vm, 'verifying_iso', 'skipped', 'Không cần tải ISO');
+          const debianPath = await imageManager.ensureImageReady(vm.osId);
+          return { isoPath: debianPath, wimIndex: 1 };
+        }
+
+        const onDetail = (detail: EnsureProgressDetail) => {
+          if (!this.vms.has(vmId)) return;
+          if (detail.stage === 'checking_cache') {
+            this.setDeploymentStage(vm, 'downloading_iso', 'active', 'Đang kiểm tra ISO trong bộ nhớ đệm...');
+            vm.isoProgress = {
+              status: 'idle',
+              percent: 0,
+              downloadedBytes: vm.isoProgress?.downloadedBytes || 0,
+              totalBytes: vm.isoProgress?.totalBytes || 0,
+            };
+          } else if (detail.stage === 'cached') {
+            this.setDeploymentStage(
+              vm,
+              'downloading_iso',
+              'skipped',
+              detail.message || 'Tái sử dụng ISO đã có trong bộ nhớ đệm',
+              100
+            );
+            this.setDeploymentStage(
+              vm,
+              'verifying_iso',
+              detail.checksumVerified ? 'completed' : 'active',
+              detail.checksumVerified ? 'Đã xác minh SHA-256 từ cache' : 'Đang xác minh SHA-256 ISO cache'
+            );
+            vm.isoProgress = {
+              status: 'cached',
+              percent: 100,
+              downloadedBytes: detail.downloadedBytes || 0,
+              totalBytes: detail.totalBytes || 0,
+              provider: detail.provider,
+              edition: detail.edition,
+              cachedReused: true,
+              checksumVerified: detail.checksumVerified,
+              resumable: false,
+            };
+          } else if (detail.stage === 'downloading') {
+            vm.status = 'Downloading Image';
+            this.syncVmLifecycle(vm, 'DOWNLOADING_ISO');
+            vm.statusMessage = detail.message;
+            this.setDeploymentStage(
+              vm,
+              'downloading_iso',
+              'active',
+              detail.message,
+              detail.percent
+            );
+            vm.isoProgress = {
+              status: 'downloading',
+              percent: detail.percent,
+              downloadedBytes: detail.downloadedBytes || 0,
+              totalBytes: detail.totalBytes || 0,
+              provider: detail.provider,
+              edition: detail.edition,
+              cachedReused: false,
+              checksumVerified: false,
+              resumable: true,
+            };
+          } else if (detail.stage === 'verifying') {
+            this.setDeploymentStage(vm, 'downloading_iso', 'completed', 'Đã tải xong ISO', 100);
+            this.setDeploymentStage(vm, 'verifying_iso', 'active', detail.message, 99);
+            vm.statusMessage = detail.message;
+            vm.isoProgress = {
+              status: 'verifying',
+              percent: 99,
+              downloadedBytes: detail.downloadedBytes || detail.totalBytes || 0,
+              totalBytes: detail.totalBytes || 0,
+              provider: detail.provider,
+              edition: detail.edition,
+              cachedReused: detail.cachedReused,
+              checksumVerified: false,
+              resumable: false,
+            };
+          } else if (detail.stage === 'ready') {
+            const dlStage = vm.deploymentStages?.find((s) => s.key === 'downloading_iso');
+            if (dlStage && dlStage.status !== 'skipped') {
+              this.setDeploymentStage(vm, 'downloading_iso', 'completed', 'Tải ISO hoàn tất', 100);
+            }
+            this.setDeploymentStage(
+              vm,
+              'verifying_iso',
+              'completed',
+              detail.checksumVerified ? 'SHA-256 trùng khớp 100%' : 'ISO hợp lệ sẵn sàng cài đặt',
+              100
+            );
+            vm.isoProgress = {
+              status: 'cached',
+              percent: 100,
+              downloadedBytes: detail.downloadedBytes || detail.totalBytes || 0,
+              totalBytes: detail.totalBytes || 0,
+              provider: detail.provider,
+              edition: detail.edition,
+              cachedReused: Boolean(detail.cachedReused),
+              checksumVerified: Boolean(detail.checksumVerified),
+              resumable: false,
+            };
+          }
+
+          if (Date.now() - lastSavedProgressAt > 4000) {
+            lastSavedProgressAt = Date.now();
+            this.saveState();
+          }
+        };
+
+        const resolved = await this.resolveWindowsBootMedia(vm, onDetail);
+        if (resolved.ensureResult && this.vms.has(vmId)) {
+          const dlStage = vm.deploymentStages?.find((s) => s.key === 'downloading_iso');
+          if (dlStage && dlStage.status !== 'skipped') {
+            this.setDeploymentStage(
+              vm,
+              'downloading_iso',
+              resolved.ensureResult.cachedReused ? 'skipped' : 'completed',
+              resolved.ensureResult.cachedReused ? 'Đã tái sử dụng ISO cache' : 'Tải ISO hoàn tất',
+              100
+            );
+          }
+          this.setDeploymentStage(
+            vm,
+            'verifying_iso',
+            'completed',
+            resolved.ensureResult.checksumVerified ? 'SHA-256 đã xác minh' : 'Kiểm tra cấu trúc ISO hợp lệ',
+            100
+          );
+          vm.isoProgress = {
+            status: 'cached',
+            percent: 100,
+            downloadedBytes: resolved.ensureResult.sizeBytes,
+            totalBytes: resolved.ensureResult.sizeBytes,
+            edition: resolved.ensureResult.edition,
+            provider: resolved.ensureResult.provider,
+            cachedReused: resolved.ensureResult.cachedReused,
+            checksumVerified: resolved.ensureResult.checksumVerified,
+            resumable: false,
+          };
+        }
+        return resolved;
       };
-      if (isWindows) {
-        resolvedMedia = await this.resolveWindowsBootMedia(vm, progressCb);
-      } else {
-        const debianPath = await imageManager.ensureImageReady(vm.osId, progressCb);
-        resolvedMedia = { isoPath: debianPath, wimIndex: 1 };
-      }
+
+      const prepTask = async (): Promise<void> => {
+        if (!this.vms.has(vmId)) return;
+
+        // Preparing storage directory
+        this.setDeploymentStage(vm, 'preparing_storage', 'active', 'Chuẩn bị thư mục lưu trữ & provisioning');
+        const provDir = path.resolve(process.cwd(), 'data', 'provisioning', vmId);
+        fs.mkdirSync(provDir, { recursive: true, mode: 0o700 });
+        this.setDeploymentStage(vm, 'preparing_storage', 'completed', `Thư mục lưu trữ ${vm.diskGb} GB sẵn sàng`);
+        this.saveState();
+
+        if (!this.vms.has(vmId)) return;
+
+        // Preparing QEMU
+        if (isWindows) {
+          this.setDeploymentStage(vm, 'preparing_qemu', 'active', 'Kiểm tra QEMU hypervisor & chế độ tăng tốc');
+          const hasQemu = await hypervisor.ensureQemuToolchain(vmId);
+          if (!hasQemu) {
+            throw new Error('QEMU binary (/usr/bin/qemu-system-x86_64) could not be prepared on host.');
+          }
+          const hasKvm = fs.existsSync('/dev/kvm');
+          this.setDeploymentStage(
+            vm,
+            'preparing_qemu',
+            'completed',
+            hasKvm ? 'QEMU + KVM tăng tốc phần cứng' : 'QEMU TCG (tb-size=32, SeaBIOS/i440fx)'
+          );
+        } else {
+          this.setDeploymentStage(vm, 'preparing_qemu', 'completed', 'Container Native / QEMU sẵn sàng');
+        }
+        this.saveState();
+
+        if (!this.vms.has(vmId)) return;
+
+        // Creating virtual QCOW2 disk
+        this.setDeploymentStage(vm, 'creating_virtual_disk', 'active', `Khởi tạo đĩa QCOW2 (${vm.diskGb} GB)`);
+        const baseDiskPath = isWindows ? imageManager.resolvePreinstalledDiskPath(vm.osId) || undefined : undefined;
+        hypervisor.prepareDisk(vmId, vm.diskGb, baseDiskPath || undefined);
+        this.setDeploymentStage(
+          vm,
+          'creating_virtual_disk',
+          'completed',
+          `Đã tạo ổ đĩa QCOW2 ${vm.diskGb} GB`
+        );
+        this.saveState();
+      };
+
+      const [resolvedMedia] = await Promise.all([isoTask(), prepTask()]);
 
       if (!this.vms.has(vmId)) return;
       const isPreinstalledDisk = Boolean(isWindows && resolvedMedia.baseDiskPath);
@@ -716,26 +1040,26 @@ export class VmManager {
         ? 'installed_disk'
         : 'iso';
 
-      // 3. Creating Virtual Disk
-      if (!this.vms.has(vmId)) return;
-      vm.status = 'Creating Disk';
-      this.syncVmLifecycle(vm, 'PREPARING');
-      vm.statusMessage = `Đang khởi tạo ổ đĩa QCOW2 bền vững dung lượng ${vm.diskGb}GB...`;
-      this.saveState();
-      serverLogger.info('Provisioner', `[Stage 3/5] Allocating storage...`, vmId);
-      hypervisor.prepareDisk(vmId, vm.diskGb, resolvedMedia.baseDiskPath);
-
-      // 4. Configuring Credentials & Booting Hypervisor
-      if (!this.vms.has(vmId)) return;
-      vm.status = 'Booting';
-      this.syncVmLifecycle(vm, 'BOOTING');
-      vm.statusMessage = 'Đang khởi động hệ điều hành và cấu hình tài khoản truy cập...';
-      this.saveState();
-      serverLogger.info('Provisioner', `[Stage 4/5] Configuring guest credentials and launching hypervisor...`, vmId);
-
       if (!effectivePwd || effectivePwd === '[POLICY_MANAGED]' || effectivePwd === '[VAULT_PROTECTED]') {
         throw new Error('Missing valid runtime guest password for credential provisioning.');
       }
+
+      // Stage 8: Starting installer / guest VM
+      if (!this.vms.has(vmId)) return;
+      vm.status = 'Booting';
+      this.syncVmLifecycle(vm, 'BOOTING');
+      this.setDeploymentStage(
+        vm,
+        'starting_installer',
+        isWindows && !isPreinstalledDisk ? 'active' : 'skipped',
+        isWindows && !isPreinstalledDisk
+          ? 'Đang tạo Autounattend.iso & khởi chạy bộ cài Windows 7 trên QEMU...'
+          : 'Khởi động trực tiếp từ hệ thống đã sẵn sàng'
+      );
+      vm.statusMessage = isWindows
+        ? `Đang khởi chạy tiến trình QEMU cho ${vm.osName}...`
+        : 'Đang khởi động hệ điều hành và cấu hình tài khoản truy cập...';
+      this.saveState();
 
       let autounattendIsoPath: string | undefined;
       if (vm.osId === 'debian-12') {
@@ -805,9 +1129,18 @@ export class VmManager {
             `Local RDP endpoint 127.0.0.1:${vm.localPort} failed X.224 handshake check: ${localBridgeCheck.statusMessage}`
           );
         }
+      } else {
+        this.setDeploymentStage(
+          vm,
+          'starting_installer',
+          isPreinstalledDisk ? 'skipped' : 'completed',
+          isPreinstalledDisk ? 'Boot trực tiếp đĩa QCOW2' : 'Bộ cài Windows đã boot trên QEMU'
+        );
       }
 
-      // 5. Public Network Synchronization
+      // Stage 10-11: Public Network Synchronization & RDP verification
+      if (!this.vms.has(vmId)) return;
+      this.setDeploymentStage(vm, 'configuring_network', 'active', 'Đang mở Public TCP Relay & chuyển tiếp cổng 3389');
       const tunnel = await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
         preferNewPort: isWindows || vm.id !== this.primaryVmId,
       });
@@ -821,6 +1154,9 @@ export class VmManager {
       const endpoint = `${assignedHost}:${assignedPort}`;
 
       if (vm.osId === 'debian-12') {
+        this.setDeploymentStage(vm, 'installing_windows', 'skipped', 'Không áp dụng cho Debian 12');
+        this.setDeploymentStage(vm, 'configuring_network', 'completed', `Public endpoint ${endpoint}`);
+        this.setDeploymentStage(vm, 'starting_rdp', 'active', 'Đang xác minh bắt tay RDP X.224...');
         let verified = false;
         for (let attempt = 1; attempt <= 4; attempt++) {
           verified = await tunnelManager.verifyExternalEndpoint(vm.id);
@@ -843,6 +1179,7 @@ export class VmManager {
         vm.credentialsConfigured = true;
         vm.credentialsConfiguredAt = completedAt;
         vm.provisioningCompletedAt = completedAt;
+        vm.deploymentCompletedAt = completedAt;
         vm.installCompleted = true;
         vm.status = 'Ready';
         this.syncVmLifecycle(vm, 'READY');
@@ -853,6 +1190,8 @@ export class VmManager {
         vm.statusMessage = 'Máy chủ đang hoạt động bình thường trên hạ tầng Google Cloud.';
         vm.isExternalVerified = true;
         vm.updatedAt = completedAt;
+        this.setDeploymentStage(vm, 'starting_rdp', 'completed', 'xrdp X.224 0xD0 đã sẵn sàng');
+        this.setDeploymentStage(vm, 'vps_ready', 'completed', `VPS sẵn sàng tại ${endpoint}`);
       } else {
         // Honest Windows RDP verification: NEVER fake Ready unless guest port 3389 answers X.224 0xD0
         vm.lifecycleState = 'CONFIGURING_RDP';
@@ -874,6 +1213,7 @@ export class VmManager {
           vm.credentialsConfigured = true;
           vm.credentialsConfiguredAt = completedAt;
           vm.provisioningCompletedAt = completedAt;
+          vm.deploymentCompletedAt = completedAt;
           vm.status = 'Ready';
           this.syncVmLifecycle(vm, 'READY');
           vm.lastBootAt = completedAt;
@@ -883,6 +1223,10 @@ export class VmManager {
           vm.isExternalVerified = verifiedExt;
           vm.statusMessage = `Máy ảo ${vm.osName} đã khởi động và xác thực RDP thành công tại ${endpoint}.`;
           vm.updatedAt = completedAt;
+          this.setDeploymentStage(vm, 'installing_windows', isPreinstalledDisk ? 'skipped' : 'completed', 'Hoàn tất cài đặt Windows');
+          this.setDeploymentStage(vm, 'configuring_network', 'completed', `Public endpoint ${endpoint}`);
+          this.setDeploymentStage(vm, 'starting_rdp', 'completed', 'Windows RDP X.224 đã phản hồi');
+          this.setDeploymentStage(vm, 'vps_ready', 'completed', `VPS sẵn sàng tại ${endpoint}`);
         } else if (!isPreinstalledDisk) {
           // Booted from genuine installer ISO on QEMU; guest Windows Setup has not finished installing RDP yet.
           const hasKvm = fs.existsSync('/dev/kvm');
@@ -895,7 +1239,16 @@ export class VmManager {
           vm.lastBootAt = new Date().toISOString();
           vm.ipAddress = assignedHost;
           vm.publicEndpoint = endpoint;
-          vm.statusMessage = `${vm.osName} đang chạy trình cài đặt Windows thật trên QEMU (${hasKvm ? 'KVM' : 'TCG — không có /dev/kvm nên cài đặt sẽ rất chậm'}). Dịch vụ RDP sẽ sẵn sàng sau khi quá trình cài đặt hoàn tất.`;
+          vm.statusMessage = `${vm.osName} đang chạy trình cài đặt Windows thật trên QEMU (${hasKvm ? 'KVM' : 'TCG — không có /dev/kvm nên cài đặt sẽ chậm'}). Dịch vụ RDP sẽ sẵn sàng sau khi quá trình cài đặt hoàn tất.`;
+          this.setDeploymentStage(
+            vm,
+            'installing_windows',
+            'active',
+            `Đang cài đặt tự động Windows 7 từ ISO thật (${hasKvm ? 'KVM' : 'QEMU TCG'})`
+          );
+          this.setDeploymentStage(vm, 'configuring_network', 'pending', `Đã cấp phát trước cổng ${endpoint}`);
+          this.setDeploymentStage(vm, 'starting_rdp', 'pending');
+          this.setDeploymentStage(vm, 'vps_ready', 'pending');
           vm.updatedAt = new Date().toISOString();
           this.saveState();
           serverLogger.info('Provisioner', `${vm.osName} VM ${vm.id} is actively installing from genuine ISO via QEMU (VNC/QMP alive; RDP pending completion).`, vmId);
@@ -917,7 +1270,7 @@ export class VmManager {
       this.provisioningCallbacks.delete(vmId);
 
       this.saveState();
-      serverLogger.info('Provisioner', `[Stage 5/5] VM online with verified credentials and endpoint: ${endpoint}`, vmId);
+      serverLogger.info('Provisioner', `VM online with verified credentials and endpoint: ${endpoint}`, vmId);
     } catch (err: unknown) {
       if (!this.vms.has(vmId)) {
         this.runtimePasswords.delete(vmId);
@@ -937,6 +1290,27 @@ export class VmManager {
       vm.isExternalVerified = false;
       vm.failureReason = fullReason;
       vm.statusMessage = `Khởi tạo thất bại: ${fullReason}`;
+
+      const failedStageKey =
+        vm.deploymentStages?.find((s) => s.status === 'active')?.key ||
+        vm.deploymentStage ||
+        'downloading_iso';
+      this.setDeploymentStage(vm, failedStageKey, 'failed', fullReason);
+
+      const partialBytes =
+        vm.osId === 'windows-7' || vm.osId === 'windows-10'
+          ? dockurEngine.getPartialDownloadBytes(imageManager.resolveIsoPath(vm.osId))
+          : 0;
+      if (vm.isoProgress) {
+        vm.isoProgress = {
+          ...vm.isoProgress,
+          status: 'failed',
+          downloadedBytes: partialBytes || vm.isoProgress.downloadedBytes,
+          resumable: partialBytes > 0,
+          error: fullReason,
+        };
+      }
+
       vm.updatedAt = new Date().toISOString();
       this.runtimePasswords.delete(vmId);
       if (vm.isApiManaged) {
@@ -1024,7 +1398,8 @@ export class VmManager {
         });
       } else {
         const installedDisk = this.hasInstalledWindowsDisk(vm.id);
-        const bootFromDiskOnly = Boolean(vm.installCompleted || installedDisk);
+        const bootFromDiskOnly = Boolean(vm.installCompleted);
+        const preferDiskBoot = !bootFromDiskOnly && Boolean(installedDisk);
         let isoPath: string | undefined;
         let isoNbdSource: NbdSource | undefined;
         let baseDiskPath: string | undefined;
@@ -1062,6 +1437,7 @@ export class VmManager {
           baseDiskPath,
           autounattendIsoPath,
           bootFromDiskOnly,
+          preferDiskBoot,
         });
         if (procInfo.memoryMb && procInfo.memoryMb !== vm.memoryMb) {
           vm.memoryMb = procInfo.memoryMb;
@@ -1172,7 +1548,8 @@ export class VmManager {
 
       if (isWindows) {
         const installedDisk = this.hasInstalledWindowsDisk(vm.id);
-        const bootFromDiskOnly = Boolean(vm.installCompleted || installedDisk);
+        const bootFromDiskOnly = Boolean(vm.installCompleted);
+        const preferDiskBoot = !bootFromDiskOnly && Boolean(installedDisk);
         const rebooted = await hypervisor.reboot(vmId);
         if (!rebooted) {
           await hypervisor.forceStop(vmId);
@@ -1199,6 +1576,7 @@ export class VmManager {
             baseDiskPath,
             autounattendIsoPath: !bootFromDiskOnly && fs.existsSync(provIso) ? provIso : undefined,
             bootFromDiskOnly,
+            preferDiskBoot,
           });
         }
       } else {
@@ -1297,13 +1675,17 @@ export class VmManager {
       if (!vm) return false;
 
       serverLogger.info('VMManager', `Deleting VM ${vmId} (${vm.osId})...`, vmId);
-      if (vm.status === 'Downloading Image') {
-        const otherDownloading = Array.from(this.vms.values()).some(
-          (other) => other.id !== vmId && other.osId === vm.osId && other.status === 'Downloading Image'
-        );
-        if (!otherDownloading) {
-          imageManager.abortActiveDownload(vm.osId);
-        }
+      const otherProvisioningSameOs = Array.from(this.vms.values()).some(
+        (other) =>
+          other.id !== vmId &&
+          other.osId === vm.osId &&
+          (other.status === 'Queued' ||
+            other.status === 'Preparing' ||
+            other.status === 'Downloading Image' ||
+            other.status === 'Creating Disk')
+      );
+      if (vm.osId !== 'debian-12' && !otherProvisioningSameOs) {
+        imageManager.abortActiveDownload(vm.osId, { removePartial: true });
       }
       await hypervisor.forceStop(vmId);
       hypervisor.cleanupVmArtifacts(vmId);
@@ -1556,6 +1938,11 @@ export class VmManager {
     failureReason?: string;
     statusMessage?: string;
     networkNotice: string;
+    deploymentStage?: DeploymentStageKey;
+    deploymentStages?: DeploymentStageItem[];
+    isoProgress?: IsoDownloadProgress;
+    deploymentStartedAt?: string;
+    deploymentCompletedAt?: string;
   } | null {
     const vm = this.getPrimaryVm();
     if (!vm) return null;
@@ -1608,6 +1995,11 @@ export class VmManager {
       securityWarning: vm.securityWarning,
       failureReason: vm.failureReason,
       statusMessage: vm.statusMessage,
+      deploymentStage: vm.deploymentStage,
+      deploymentStages: vm.deploymentStages,
+      isoProgress: vm.isoProgress,
+      deploymentStartedAt: vm.deploymentStartedAt,
+      deploymentCompletedAt: vm.deploymentCompletedAt,
       networkNotice: vm.status === 'Failed'
         ? `Máy ảo ${vm.osName} hiện không khả dụng: ${vm.failureReason || vm.statusMessage || 'Khởi tạo thất bại.'}`
         : vm.status === 'Stopped'
@@ -1661,6 +2053,9 @@ export class VmManager {
             vm.statusMessage = diag?.oomDetected
               ? `Máy ảo bị dừng do thiếu RAM (OOM): ${reason}`
               : `Cài đặt gián đoạn: ${reason}`;
+            const failedStageKey =
+              vm.deploymentStages?.find((s) => s.status === 'active')?.key || 'installing_windows';
+            this.setDeploymentStage(vm, failedStageKey, 'failed', reason);
             vm.updatedAt = new Date().toISOString();
             const cbs = this.provisioningCallbacks.get(vm.id);
             if (cbs?.onProvisionFailed) {
@@ -1677,6 +2072,9 @@ export class VmManager {
           if (hypervisor.inspectDiskHasBootableWindowsPartition(vmDiskPath) && vm.lifecycleState === 'INSTALLING') {
             vm.bootMode = 'disk';
             this.syncVmLifecycle(vm, 'CONFIGURING_RDP');
+            this.setDeploymentStage(vm, 'installing_windows', 'completed', 'Windows đã ghi phân vùng khởi động lên QCOW2');
+            this.setDeploymentStage(vm, 'configuring_network', 'completed', `Endpoint ${vm.publicEndpoint}`);
+            this.setDeploymentStage(vm, 'starting_rdp', 'active', 'Đang khởi chạy dịch vụ Remote Desktop trong guest...');
             vm.statusMessage = `${vm.osName} đã ghi dữ liệu khởi động lên đĩa QCOW2; đang cấu hình mạng & dịch vụ Remote Desktop (RDP)...`;
             vm.updatedAt = new Date().toISOString();
             this.saveState();
@@ -1692,6 +2090,7 @@ export class VmManager {
             vm.credentialsConfigured = true;
             vm.credentialsConfiguredAt = completedAt;
             vm.provisioningCompletedAt = completedAt;
+            vm.deploymentCompletedAt = completedAt;
             vm.rdpHealth = rdp;
             vm.status = 'Ready';
             this.syncVmLifecycle(vm, 'READY');
@@ -1700,6 +2099,10 @@ export class VmManager {
             delete vm.remediation;
             vm.isExternalVerified = verifiedExt;
             vm.statusMessage = `Quá trình cài đặt ${vm.osName} đã hoàn tất, đã boot từ đĩa QCOW2 và dịch vụ RDP đã sẵn sàng.`;
+            this.setDeploymentStage(vm, 'installing_windows', 'completed', 'Hoàn tất cài đặt Windows trên QCOW2');
+            this.setDeploymentStage(vm, 'configuring_network', 'completed', `Public endpoint ${vm.publicEndpoint}`);
+            this.setDeploymentStage(vm, 'starting_rdp', 'completed', 'Windows RDP X.224 0xD0 sẵn sàng');
+            this.setDeploymentStage(vm, 'vps_ready', 'completed', `VPS sẵn sàng tại ${vm.publicEndpoint}`);
             vm.updatedAt = completedAt;
 
             const cbs = this.provisioningCallbacks.get(vm.id);
@@ -1718,11 +2121,15 @@ export class VmManager {
             this.saveState();
             await hypervisor.ejectCdromDrive(vm.id, 'cdrom0');
             await hypervisor.ejectCdromDrive(vm.id, 'cdrom1');
-            this.reclaimUnusedIsoMemory(vm.osId);
+            // Reclaim ISO RAM only when container free RAM is low (< 2.5 GiB) so cached ISO remains reusable otherwise
+            const availMb = Math.floor(getContainerMemAvailableBytes() / (1024 * 1024));
+            if (availMb < 2560) {
+              this.reclaimUnusedIsoMemory(vm.osId);
+            }
           }
         }
       }
-    }, 15000);
+    }, 5000);
   }
 }
 
@@ -1954,6 +2361,9 @@ export function buildWindowsAutounattendXml(opts: {
     '    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
     ...diskConfigBlock,
     '      <UserData>',
+    '        <ProductKey>',
+    '          <WillShowUI>Never</WillShowUI>',
+    '        </ProductKey>',
     '        <AcceptEula>true</AcceptEula>',
     `        <FullName>${escapedUser}</FullName>`,
     '        <Organization>Moon Studio</Organization>',
@@ -1984,8 +2394,8 @@ export function buildWindowsAutounattendXml(opts: {
     '        </RunSynchronousCommand>',
     '        <RunSynchronousCommand wcm:action="add">',
     '          <Order>4</Order>',
-    '          <Path>cmd /c reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f &amp; reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f &amp; netsh advfirewall firewall set rule group="remote desktop" new enable=Yes</Path>',
-    '          <Description>Enable Remote Desktop and firewall exception early in specialize</Description>',
+    '          <Path>cmd /c reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f &amp; reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f &amp; sc config TermService start= auto &amp; net start TermService &amp; netsh advfirewall firewall set rule group="remote desktop" new enable=Yes</Path>',
+    '          <Description>Enable Remote Desktop, TermService, and firewall exception early in specialize</Description>',
     '        </RunSynchronousCommand>',
     '      </RunSynchronous>',
     '    </component>',
@@ -2042,7 +2452,7 @@ export function buildWindowsAutounattendXml(opts: {
     '        <SynchronousCommand wcm:action="add">',
     '          <Order>1</Order>',
     '          <Description>Ensure hibernation off and Remote Desktop active</Description>',
-    '          <CommandLine>cmd /c powercfg -h off &amp; reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f &amp; netsh advfirewall firewall set rule group="remote desktop" new enable=Yes</CommandLine>',
+    '          <CommandLine>cmd /c powercfg -h off &amp; reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f &amp; sc config TermService start= auto &amp; net start TermService &amp; netsh advfirewall firewall set rule group="remote desktop" new enable=Yes</CommandLine>',
     '        </SynchronousCommand>',
     '      </FirstLogonCommands>',
     '    </component>',

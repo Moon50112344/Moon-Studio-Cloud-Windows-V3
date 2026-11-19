@@ -68,6 +68,11 @@ apiRouter.get('/connection', async (_req: Request, res: Response) => {
     failureReason: info.failureReason,
     statusMessage: info.statusMessage,
     networkNotice: info.networkNotice,
+    deploymentStage: info.deploymentStage,
+    deploymentStages: info.deploymentStages,
+    isoProgress: info.isoProgress,
+    deploymentStartedAt: info.deploymentStartedAt,
+    deploymentCompletedAt: info.deploymentCompletedAt,
   });
 });
 
@@ -343,7 +348,9 @@ apiRouter.get('/vms', (_req: Request, res: Response) => {
 });
 
 apiRouter.post('/vms', async (req: Request, res: Response) => {
-  const { osId, name, cores, memoryMb, diskGb } = req.body || {};
+  const { name, cores, memoryMb, diskGb } = req.body || {};
+  const rawOsId = req.body?.osId;
+  const osId = rawOsId === undefined || rawOsId === null || rawOsId === '' ? 'windows-7' : rawOsId;
 
   // Strict validation of allowed OS IDs
   if (!isSupportedOsId(osId)) {
@@ -452,6 +459,12 @@ apiRouter.post('/vms/:id/delete', async (req: Request, res: Response) => {
 apiRouter.post('/vms/:id/rebuild', async (req: Request, res: Response) => {
   if (!vmManager.getVm(req.params.id)) return res.status(404).json({ success: false, error: 'VM not found' });
   const vm = await vmManager.rebuildVm(req.params.id);
+  return res.json({ success: !!vm, vm });
+});
+
+apiRouter.post('/vms/:id/retry', async (req: Request, res: Response) => {
+  if (!vmManager.getVm(req.params.id)) return res.status(404).json({ success: false, error: 'VM not found' });
+  const vm = await vmManager.retryVmProvisioning(req.params.id);
   return res.json({ success: !!vm, vm });
 });
 

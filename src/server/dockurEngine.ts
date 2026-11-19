@@ -311,7 +311,19 @@ export class DockurEngine {
     return this.activeDownloads.has(osId);
   }
 
-  public abortDownload(osId: SupportedOsId): boolean {
+  public getPartialDownloadBytes(destPath: string): number {
+    const tmpPath = `${destPath}.downloading`;
+    try {
+      if (fs.existsSync(tmpPath)) {
+        return fs.statSync(tmpPath).size;
+      }
+    } catch {
+      // ignore
+    }
+    return 0;
+  }
+
+  public abortDownload(osId: SupportedOsId, options?: { removePartial?: boolean }): boolean {
     const active = this.activeDownloads.get(osId);
     if (!active) return false;
     active.aborted = true;
@@ -320,7 +332,7 @@ export class DockurEngine {
     } catch {
       // ignore
     }
-    if (fs.existsSync(active.tmpPath)) {
+    if (options?.removePartial && fs.existsSync(active.tmpPath)) {
       try {
         fs.unlinkSync(active.tmpPath);
       } catch {
@@ -666,7 +678,10 @@ export class DockurEngine {
         }
       }
 
-      if (!mirrorAborted && fs.existsSync(tmpPath)) {
+      const partialSize = this.getPartialDownloadBytes(destPath);
+      const isChecksumFailure = errors.some((m) => m.includes('CHECKSUM_MISMATCH'));
+      // Preserve >= 10 MiB partial download for resumable retry (curl -C -) unless aborted or checksum mismatched
+      if (fs.existsSync(tmpPath) && (mirrorAborted || isChecksumFailure || partialSize < 10 * 1024 * 1024)) {
         try {
           fs.unlinkSync(tmpPath);
         } catch {
